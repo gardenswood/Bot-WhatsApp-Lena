@@ -1,0 +1,56 @@
+name: Deploy Bot Vicky a Cloud Run
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'bot.js'
+      - 'firestore-module.js'
+      - 'package.json'
+      - 'Dockerfile'
+      - '.github/workflows/**'
+  workflow_dispatch:  # Permite ejecutar manualmente desde GitHub
+
+jobs:
+  deploy:
+    name: Build & Deploy Bot
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Autenticar con Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: webgardens-8655d
+
+      - name: Deploy Bot a Cloud Run
+        run: |
+          echo "🤖 Iniciando deploy del bot..."
+          gcloud run deploy vicky-bot \
+            --source . \
+            --region=us-central1 \
+            --platform=managed \
+            --port=8080 \
+            --project=webgardens-8655d
+          echo "✅ Bot desplegado"
+
+      - name: Verificar bot
+        run: |
+          URL=$(gcloud run services describe vicky-bot \
+            --region=us-central1 \
+            --format='value(status.url)')
+          echo "🤖 Bot disponible en: $URL"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+          echo "Health check → $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "❌ Health check falló"
+            exit 1
+          fi
+          echo "✅ Bot saludable"

@@ -4,7 +4,10 @@
   "description": "Bot automatizado para enviar catálogo de leña por WhatsApp",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "deploy": "node scripts/deploy.js",
+    "deploy:watch": "node scripts/deploy.js --watch",
+    "deploy:dry": "node scripts/deploy.js --dry-run"
   },
   "dependencies": {
     "@adiwajshing/keyed-db": "^0.2.4",
