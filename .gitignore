@@ -1,0 +1,13 @@
+node_modules/
+auth_info_baileys/
+.wwebjs_auth/
+.wwebjs_cache/
+usuarios_vistos.json
+cola_lena.json
+qr.png
+*.log
+.env
+.env.local
+ElevenLabs_*.mp3
+assets/
+images/

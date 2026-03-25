@@ -1,0 +1,12 @@
+.gcloudignore
+.git
+.gitignore
+node_modules/
+auth_info_baileys/
+usuarios_vistos.json
+cola_lena.json
+qr.png
+*.log
+.env
+.env.local
+.cursor/

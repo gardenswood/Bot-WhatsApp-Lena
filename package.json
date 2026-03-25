@@ -1,0 +1,23 @@
+{
+  "name": "bot-whatsapp-lena",
+  "version": "1.0.0",
+  "description": "Bot automatizado para enviar catálogo de leña por WhatsApp",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@adiwajshing/keyed-db": "^0.2.4",
+    "@google-cloud/storage": "^7.19.0",
+    "@google/generative-ai": "^0.24.1",
+    "@sparticuz/chromium": "^143.0.4",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "firebase-admin": "^13.7.0",
+    "libsignal-node": "^2.0.1",
+    "mime-types": "^2.1.35",
+    "pino": "^8.21.0",
+    "puppeteer-core": "^24.40.0",
+    "qr-image": "^3.2.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
