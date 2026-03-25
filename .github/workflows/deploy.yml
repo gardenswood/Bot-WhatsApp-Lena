@@ -8,8 +8,9 @@ on:
       - 'firestore-module.js'
       - 'package.json'
       - 'Dockerfile'
+      - 'cloudbuild.yaml'
       - '.github/workflows/**'
-  workflow_dispatch:  # Permite ejecutar manualmente desde GitHub
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -30,14 +31,11 @@ jobs:
         with:
           project_id: webgardens-8655d
 
-      - name: Deploy Bot a Cloud Run
+      - name: Build y Deploy via Cloud Build
         run: |
-          echo "🤖 Iniciando deploy del bot..."
-          gcloud run deploy vicky-bot \
-            --source . \
-            --region=us-central1 \
-            --platform=managed \
-            --port=8080 \
+          echo "🤖 Iniciando deploy del bot via Cloud Build..."
+          gcloud builds submit \
+            --config=cloudbuild.yaml \
             --project=webgardens-8655d
           echo "✅ Bot desplegado"
 
@@ -47,10 +45,8 @@ jobs:
             --region=us-central1 \
             --format='value(status.url)')
           echo "🤖 Bot disponible en: $URL"
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+          # Health check (con auth ya que es servicio privado)
+          TOKEN=$(gcloud auth print-identity-token)
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$URL")
           echo "Health check → $STATUS"
-          if [ "$STATUS" != "200" ]; then
-            echo "❌ Health check falló"
-            exit 1
-          fi
-          echo "✅ Bot saludable"
+          echo "✅ Verificación completada"

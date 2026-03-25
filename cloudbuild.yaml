@@ -1,0 +1,30 @@
+steps:
+  # Build Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--tag=gcr.io/$PROJECT_ID/vicky-bot:latest'
+      - '.'
+
+  # Push to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/vicky-bot:latest']
+
+  # Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'vicky-bot'
+      - '--image=gcr.io/$PROJECT_ID/vicky-bot:latest'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--port=8080'
+      - '--no-allow-unauthenticated'
+
+images:
+  - 'gcr.io/$PROJECT_ID/vicky-bot:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
