@@ -1427,39 +1427,56 @@ async function connectToWhatsApp() {
     // Baileys incluye el campo `lid` en los contactos @s.whatsapp.net cuando el usuario
     // tiene la identidad de dispositivo vinculado activa
     socket.ev.on('contacts.upsert', (contacts) => {
-        let nuevos = 0;
+        let nuevosPhone = 0;
+        let nuevosNombre = 0;
+        let guardadosPendientes = false;
+
         for (const contact of contacts) {
-            // Caso A: contacto con JID de teléfono que también tiene lid
+            const lidId = contact.id?.endsWith('@lid')
+                ? contact.id.replace(/@lid$/, '')
+                : (contact.lid ? contact.lid.replace(/@lid$/, '') : null);
+
+            // ── Mapeo @lid → teléfono ──
+            // Caso A: contacto @s.whatsapp.net con campo lid
             if (contact.id?.endsWith('@s.whatsapp.net') && contact.lid) {
-                const lidId = contact.lid.replace(/@lid$/, '');
                 const phone = contact.id.replace(/@s\.whatsapp\.net$/, '');
-                if (!lidToPhone.has(lidId)) {
-                    lidToPhone.set(lidId, phone);
-                    nuevos++;
-                    // Actualizar historial si ya existe este @lid como cliente
-                    const clienteLid = clientesHistorial[lidId];
-                    if (clienteLid && !clienteLid.telefono) {
-                        clienteLid.telefono = phone;
-                        saveHistorialGCS().catch(() => {});
-                    }
+                const lid = contact.lid.replace(/@lid$/, '');
+                if (!lidToPhone.has(lid)) {
+                    lidToPhone.set(lid, phone);
+                    nuevosPhone++;
+                    const c = clientesHistorial[lid];
+                    if (c && !c.telefono) { c.telefono = phone; guardadosPendientes = true; }
                 }
             }
-            // Caso B: contacto con JID @lid que trae su número en el campo lid (formato inverso)
+            // Caso B: contacto @lid con campo lid apuntando a @s.whatsapp.net
             if (contact.id?.endsWith('@lid') && contact.lid?.endsWith('@s.whatsapp.net')) {
-                const lidId = contact.id.replace(/@lid$/, '');
+                const lid = contact.id.replace(/@lid$/, '');
                 const phone = contact.lid.replace(/@s\.whatsapp\.net$/, '');
-                if (!lidToPhone.has(lidId)) {
-                    lidToPhone.set(lidId, phone);
-                    nuevos++;
-                    const clienteLid = clientesHistorial[lidId];
-                    if (clienteLid && !clienteLid.telefono) {
-                        clienteLid.telefono = phone;
-                        saveHistorialGCS().catch(() => {});
-                    }
+                if (!lidToPhone.has(lid)) {
+                    lidToPhone.set(lid, phone);
+                    nuevosPhone++;
+                    const c = clientesHistorial[lid];
+                    if (c && !c.telefono) { c.telefono = phone; guardadosPendientes = true; }
+                }
+            }
+
+            // ── Guardar nombre/pushName para clientes existentes ──
+            // contact.notify = pushName (nombre configurado en WhatsApp)
+            // contact.name   = nombre guardado en agenda del teléfono del admin
+            const nombreContacto = contact.notify || contact.name || null;
+            if (nombreContacto && lidId) {
+                const cliente = clientesHistorial[lidId];
+                if (cliente && !cliente.pushName) {
+                    cliente.pushName = nombreContacto;
+                    nuevosNombre++;
+                    guardadosPendientes = true;
                 }
             }
         }
-        if (nuevos > 0) console.log(`📞 ${nuevos} nuevos mapeos @lid→teléfono registrados (total: ${lidToPhone.size})`);
+
+        if (guardadosPendientes) saveHistorialGCS().catch(() => {});
+        if (nuevosPhone > 0) console.log(`📞 ${nuevosPhone} mapeos @lid→teléfono registrados`);
+        if (nuevosNombre > 0) console.log(`📛 ${nuevosNombre} nombres de contacto guardados en historial`);
     });
 
     socket.ev.on('creds.update', async () => {
