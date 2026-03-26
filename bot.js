@@ -772,6 +772,115 @@ function buscarClientePorNombre(nombre) {
     );
 }
 
+// Detecta si un texto del admin es SOLO un destinatario (número, nombre, #N, "último")
+// y lo resuelve a { jid, etiqueta } o devuelve null si no es un destinatario simple.
+async function resolverDestinatarioAdmin(socket, texto, sesionAdmin) {
+    const t = texto.trim();
+
+    // ── Selección por número de lista (#N o "el N" o solo "N")
+    const porNumero = t.match(/^(?:#|el\s+)?(\d{1,2})$/i);
+    if (porNumero) {
+        const n = parseInt(porNumero[1], 10);
+        const jid = sesionAdmin?.listaClientes?.[n];
+        if (jid) {
+            const datos = getCliente(jid) || {};
+            const etiqueta = datos.nombre || datos.pushName || `#${n}`;
+            return { jid, etiqueta };
+        }
+        return null;
+    }
+
+    // ── "el último" / "último"
+    if (/^(el\s+)?[uú]ltimo$/i.test(t)) {
+        const candidatos = Object.values(clientesHistorial)
+            .filter(d => d.remoteJid && d.ultimoMensaje)
+            .sort((a, b) => b.ultimoMensaje - a.ultimoMensaje);
+        if (candidatos.length > 0) {
+            const d = candidatos[0];
+            return { jid: d.remoteJid, etiqueta: d.nombre || d.pushName || d.remoteJid };
+        }
+        return null;
+    }
+
+    // ── Número de teléfono (solo dígitos, guiones y espacios)
+    const soloDigitos = t.replace(/[\s\-().]/g, '');
+    if (/^\d{6,}$/.test(soloDigitos)) {
+        let tel = soloDigitos;
+        if (!tel.startsWith('54') && tel.length <= 12) tel = '54' + tel;
+        try {
+            const [info] = await socket.onWhatsApp(tel);
+            if (info?.exists) {
+                const datos = getCliente(info.jid) || {};
+                const etiqueta = datos.nombre || datos.pushName || soloDigitos;
+                return { jid: info.jid, etiqueta };
+            }
+        } catch (e) {
+            console.warn(`⚠️ resolverDestinatario: no se pudo verificar ${tel}:`, e.message);
+        }
+        return null;
+    }
+
+    // ── Últimos 4 dígitos (*XXXX o "termina en XXXX")
+    const ultimos4 = t.match(/^(?:\*|termina\s+en\s+|finalizado\s+en\s+)(\d{4})$/i);
+    if (ultimos4) {
+        const sufijo = ultimos4[1];
+        const resultado = Object.entries(clientesHistorial).find(([key, datos]) => {
+            const candidatos = [key, datos.telefono || '', (datos.remoteJid || '').replace(/@.+$/, ''),
+                lidToPhone.get(key) || '', lidToPhone.get((datos.remoteJid || '').replace(/@.+$/, '')) || ''];
+            return candidatos.some(c => c.endsWith(sufijo));
+        });
+        if (resultado) {
+            const [, datos] = resultado;
+            return { jid: datos.remoteJid, etiqueta: datos.nombre || datos.pushName || `…${sufijo}` };
+        }
+        return null;
+    }
+
+    // ── Nombre (texto corto sin verbos de acción → es un nombre)
+    const VERBOS_ACCION = /\b(que|decile|avisale|mandá|contale|escribile|informale|decí|avisa|manda|envía|enviá)\b/i;
+    if (t.length < 40 && !VERBOS_ACCION.test(t)) {
+        const resultado = buscarClientePorNombre(t);
+        if (resultado) {
+            const [, datos] = resultado;
+            return { jid: datos.remoteJid, etiqueta: datos.nombre || datos.pushName || t };
+        }
+        // No encontrado por nombre → no es un destinatario reconocible
+        return null;
+    }
+
+    // Texto largo o con verbos → no es un destinatario, es una instrucción completa
+    return null;
+}
+
+// Recibe el contenido (audio base64 o texto plano) y lo redacta como mensaje de Gardens Wood.
+// NO interpreta destinatario — solo produce el texto del mensaje.
+async function redactarMensajeAdmin(audioBase64, textoContenido) {
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+
+    const PROMPT_REDACCION = `Sos el asistente de redacción de Vicky, el bot de Gardens Wood.
+El dueño del negocio te manda una instrucción en audio o texto con lo que quiere decirle a un cliente.
+Tu trabajo es redactar el mensaje de forma natural, cálida y directa, como si lo escribiera Vicky.
+Devolvé SOLO el texto del mensaje, sin explicaciones ni marcadores.
+El mensaje debe ser conciso, amigable y en español rioplatense.`;
+
+    let partes;
+    if (audioBase64) {
+        partes = [
+            { inlineData: { data: audioBase64, mimeType: 'audio/ogg' } },
+            { text: 'Transcribí el audio y redactá el mensaje para el cliente.' }
+        ];
+    } else {
+        partes = [{ text: `Redactá este mensaje para el cliente: "${textoContenido}"` }];
+    }
+
+    const result = await model.generateContent({
+        systemInstruction: PROMPT_REDACCION,
+        contents: [{ role: 'user', parts: partes }]
+    });
+    return result.response.text().trim();
+}
+
 async function procesarComandoAdmin(socket, adminJid, audioBase64, textoAdmin) {
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
     const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
@@ -1547,25 +1656,78 @@ async function connectToWhatsApp() {
                         const existing = adminSesionesActivas.get(remoteJid) || {};
                         adminSesionesActivas.set(remoteJid, {
                             activadoEn: Date.now(),
-                            listaClientes: existing.listaClientes || {}
+                            listaClientes: existing.listaClientes || {},
+                            destinatarioPendiente: null
                         });
                         console.log(`🔑 Sesión admin activada para ${remoteJid} (válida 1 hora)`);
                     }
 
-                    // Si es solo "!vicky" sin instrucción, confirmar activación y esperar el audio/texto
+                    // Extraer texto limpio (sin el prefijo "!vicky" si lo tiene)
                     const instruccionTexto = esFraseAdmin
                         ? textoRaw.slice(ADMIN_SECRET.length).trim()
                         : textoRaw;
 
+                    // ── Activación sin instrucción: pedir destinatario
                     if (!tieneAudioMsg && !instruccionTexto) {
                         await sendBotMessage(remoteJid, {
-                            text: '🔑 Sesión admin activada. Ahora mandá el audio o texto con la instrucción.'
+                            text: '🔑 Sesión admin activada. ¿A quién le mando?\n\n_Mandá el número, el nombre o elegí de la lista con "Vicky lista"._'
                         });
                         return;
                     }
 
                     if (tieneAudioMsg || instruccionTexto) {
                         console.log(`🔑 Comando admin desde ${remoteJid} (${sesionAdminActiva ? 'sesión activa' : esFraseAdmin ? 'frase secreta' : 'JID'})`);
+
+                        const sesion = adminSesionesActivas.get(remoteJid);
+
+                        // ── PASO 2: hay destinatario pendiente + llega audio o texto con contenido
+                        if (sesion?.destinatarioPendiente && (tieneAudioMsg || instruccionTexto)) {
+                            const { jid: jidDestino, etiqueta } = sesion.destinatarioPendiente;
+
+                            let audioAdminBase64 = null;
+                            if (tieneAudioMsg) {
+                                try {
+                                    const buf = await downloadMediaMessage(msg, 'buffer', {}, {
+                                        logger: pino({ level: 'silent' }),
+                                        reuploadRequest: socket.updateMediaMessage
+                                    });
+                                    audioAdminBase64 = buf.toString('base64');
+                                } catch (e) {
+                                    console.error('❌ Error descargando audio admin:', e.message);
+                                }
+                            }
+
+                            try {
+                                const mensajeRedactado = await redactarMensajeAdmin(audioAdminBase64, instruccionTexto);
+                                await socket.sendMessage(jidDestino, { text: mensajeRedactado });
+                                console.log(`📤 Mensaje 2-pasos enviado a ${etiqueta} (${jidDestino})`);
+                                await sendBotMessage(remoteJid, {
+                                    text: `✅ Mensaje enviado a *${etiqueta}*:\n\n_"${mensajeRedactado}"_`
+                                });
+                                // Limpiar destinatario para el próximo envío
+                                sesion.destinatarioPendiente = null;
+                            } catch (err) {
+                                console.error('❌ Error en envío 2-pasos:', err.message);
+                                await sendBotMessage(remoteJid, { text: `❌ Error al enviar: ${err.message}` });
+                            }
+                            return;
+                        }
+
+                        // ── PASO 1: llega texto sin audio → intentar resolver como destinatario
+                        if (!tieneAudioMsg && instruccionTexto) {
+                            const destinatario = await resolverDestinatarioAdmin(socket, instruccionTexto, sesion);
+                            if (destinatario) {
+                                // Es un destinatario reconocible → guardarlo y pedir el contenido
+                                if (sesion) sesion.destinatarioPendiente = destinatario;
+                                await sendBotMessage(remoteJid, {
+                                    text: `👤 Listo, ¿qué le mando a *${destinatario.etiqueta}*?\n\n_Mandá el audio o escribí el mensaje._`
+                                });
+                                return;
+                            }
+                            // No es un destinatario simple → es una instrucción completa, flujo original
+                        }
+
+                        // ── FLUJO ORIGINAL (fallback): audio o instrucción completa con destinatario incluido
                         let audioAdminBase64 = null;
                         if (tieneAudioMsg) {
                             try {
