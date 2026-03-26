@@ -900,13 +900,17 @@ async function procesarComandoAdmin(socket, adminJid, audioBase64, textoAdmin) {
                     const nombreReal = datosCliente.nombre || `...${sufijo}`;
                     await enviarYConfirmar(datosCliente.remoteJid, mensajeCliente, `${nombreReal} (…${sufijo})`);
                 } else {
-                    // Fallback: mostrar la lista para que el admin elija por número
+                    // Fallback: pedir número completo + mostrar lista como alternativa
                     const { texto, mapa } = generarListaClientes(adminJid);
                     const sesion = adminSesionesActivas.get(adminJid) || { activadoEn: Date.now(), listaClientes: {} };
                     sesion.listaClientes = mapa;
                     adminSesionesActivas.set(adminJid, sesion);
                     await responder(adminJid, {
-                        text: `❌ No encontré a nadie con número terminado en *${sufijo}*.\n\n_Los clientes con WhatsApp multi-dispositivo no tienen número buscable. Usá el número de la lista:_\n\n${texto}`
+                        text: `❌ No encontré a nadie con número terminado en *${sufijo}*.\n\n` +
+                              `💡 *Si tenés el número completo*, decime:\n` +
+                              `_"mandá al 3512xx${sufijo} que..."_\n` +
+                              `(con el número completo funciona siempre, aunque no esté en el historial)\n\n` +
+                              `📋 *O elegí de la lista:*\n${texto}`
                     });
                 }
             } else if (esNumeroCompleto) {
@@ -935,8 +939,16 @@ async function procesarComandoAdmin(socket, adminJid, audioBase64, textoAdmin) {
                     await enviarYConfirmar(datosCliente.remoteJid, mensajeCliente, nombreReal);
                 } else {
                     console.warn(`⚠️ Cliente "${destinatario}" no encontrado en historial`);
+                    const { texto: textoLista, mapa: mapaLista } = generarListaClientes(adminJid);
+                    const sesionFallback = adminSesionesActivas.get(adminJid) || { activadoEn: Date.now(), listaClientes: {} };
+                    sesionFallback.listaClientes = mapaLista;
+                    adminSesionesActivas.set(adminJid, sesionFallback);
                     await responder(adminJid, {
-                        text: `❌ No encontré a *${destinatario}* en el historial.\n\nPodés usar:\n• *"Vicky lista"* para ver los clientes numerados\n• *"el que termina en 6376"* si sabés los últimos 4 dígitos\n• El número completo`
+                        text: `❌ No encontré a *${destinatario}* en el historial.\n\n` +
+                              `💡 *Si tenés el número completo*, decime:\n` +
+                              `_"mandá al 3512XXXXXX que..."_\n` +
+                              `(el número completo funciona siempre)\n\n` +
+                              `📋 *O elegí de la lista:*\n${textoLista}`
                     });
                 }
             }
