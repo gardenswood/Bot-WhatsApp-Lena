@@ -486,6 +486,10 @@ const ADMIN_SECRET = (process.env.ADMIN_SECRET || '!vicky').toLowerCase().trim()
 // Cada entrada: { activadoEn: timestamp, listaClientes: { 1: jid, 2: jid, ... } }
 const adminSesionesActivas = new Map();
 const ADMIN_SESSION_TTL = 60 * 60 * 1000; // 1 hora
+
+// Mapeo @lid → teléfono real, construido desde contactos sincronizados por Baileys
+// Claves: lid numérico (sin @lid). Valores: teléfono (sin @s.whatsapp.net)
+const lidToPhone = new Map();
 const UMBRAL_COLA_KG = 500; // Total acumulado en cola para disparar notificación al admin
 const LIMITE_INDIVIDUAL_KG = 200; // Pedidos > 200kg se entregan individual, ≤ 200kg van a cola grupal
 
@@ -711,9 +715,16 @@ function generarListaClientes(adminJid) {
         // Nombre: usar el guardado o "Sin nombre"
         const nombre = datos.nombre ? `*${datos.nombre}*` : '_Sin nombre_';
 
-        // Teléfono: mostrar los últimos 8 dígitos para que sea identificable
-        const telRaw = datos.telefono || datos.remoteJid.replace(/@.+$/, '');
-        const telMostrar = telRaw.length > 8 ? `…${telRaw.slice(-8)}` : telRaw;
+        // Teléfono: usar el real si está disponible, o intentar resolver por lidToPhone
+        const lidId = datos.remoteJid?.replace(/@.+$/, '');
+        const telResuelto = datos.telefono || lidToPhone.get(lidId) || null;
+        let telMostrar;
+        if (telResuelto) {
+            telMostrar = telResuelto.length > 8 ? `…${telResuelto.slice(-8)}` : telResuelto;
+        } else {
+            // @lid sin número resuelto: mostrar aviso
+            telMostrar = `_(sin tel. — ID: …${lidId ? lidId.slice(-6) : '?'})_`;
+        }
 
         // Servicio / estado
         const servicio = datos.servicioPendiente || '';
@@ -877,7 +888,10 @@ async function procesarComandoAdmin(socket, adminJid, audioBase64, textoAdmin) {
                     const candidatos = [
                         key,
                         datos.telefono || '',
-                        (datos.remoteJid || '').replace(/@.+$/, '')
+                        (datos.remoteJid || '').replace(/@.+$/, ''),
+                        // También buscar en el teléfono real resuelto para @lid
+                        lidToPhone.get(key) || '',
+                        lidToPhone.get((datos.remoteJid || '').replace(/@.+$/, '')) || ''
                     ];
                     return candidatos.some(c => c.endsWith(sufijo));
                 });
@@ -886,8 +900,13 @@ async function procesarComandoAdmin(socket, adminJid, audioBase64, textoAdmin) {
                     const nombreReal = datosCliente.nombre || `...${sufijo}`;
                     await enviarYConfirmar(datosCliente.remoteJid, mensajeCliente, `${nombreReal} (…${sufijo})`);
                 } else {
+                    // Fallback: mostrar la lista para que el admin elija por número
+                    const { texto, mapa } = generarListaClientes(adminJid);
+                    const sesion = adminSesionesActivas.get(adminJid) || { activadoEn: Date.now(), listaClientes: {} };
+                    sesion.listaClientes = mapa;
+                    adminSesionesActivas.set(adminJid, sesion);
                     await responder(adminJid, {
-                        text: `❌ No encontré ningún contacto con número terminado en *${sufijo}* en el historial.\n\nPasame el número completo y lo busco en WhatsApp.`
+                        text: `❌ No encontré a nadie con número terminado en *${sufijo}*.\n\n_Los clientes con WhatsApp multi-dispositivo no tienen número buscable. Usá el número de la lista:_\n\n${texto}`
                     });
                 }
             } else if (esNumeroCompleto) {
@@ -1392,6 +1411,45 @@ async function connectToWhatsApp() {
 
     // Solo subir creds.json cuando cambian las credenciales — con debounce para no saturar GCS
     let credsUploadTimer = null;
+    // Captura el mapeo @lid → teléfono real cuando WhatsApp sincroniza contactos
+    // Baileys incluye el campo `lid` en los contactos @s.whatsapp.net cuando el usuario
+    // tiene la identidad de dispositivo vinculado activa
+    socket.ev.on('contacts.upsert', (contacts) => {
+        let nuevos = 0;
+        for (const contact of contacts) {
+            // Caso A: contacto con JID de teléfono que también tiene lid
+            if (contact.id?.endsWith('@s.whatsapp.net') && contact.lid) {
+                const lidId = contact.lid.replace(/@lid$/, '');
+                const phone = contact.id.replace(/@s\.whatsapp\.net$/, '');
+                if (!lidToPhone.has(lidId)) {
+                    lidToPhone.set(lidId, phone);
+                    nuevos++;
+                    // Actualizar historial si ya existe este @lid como cliente
+                    const clienteLid = clientesHistorial[lidId];
+                    if (clienteLid && !clienteLid.telefono) {
+                        clienteLid.telefono = phone;
+                        saveHistorialGCS().catch(() => {});
+                    }
+                }
+            }
+            // Caso B: contacto con JID @lid que trae su número en el campo lid (formato inverso)
+            if (contact.id?.endsWith('@lid') && contact.lid?.endsWith('@s.whatsapp.net')) {
+                const lidId = contact.id.replace(/@lid$/, '');
+                const phone = contact.lid.replace(/@s\.whatsapp\.net$/, '');
+                if (!lidToPhone.has(lidId)) {
+                    lidToPhone.set(lidId, phone);
+                    nuevos++;
+                    const clienteLid = clientesHistorial[lidId];
+                    if (clienteLid && !clienteLid.telefono) {
+                        clienteLid.telefono = phone;
+                        saveHistorialGCS().catch(() => {});
+                    }
+                }
+            }
+        }
+        if (nuevos > 0) console.log(`📞 ${nuevos} nuevos mapeos @lid→teléfono registrados (total: ${lidToPhone.size})`);
+    });
+
     socket.ev.on('creds.update', async () => {
         await saveCreds();
         if (credsUploadTimer) clearTimeout(credsUploadTimer);
