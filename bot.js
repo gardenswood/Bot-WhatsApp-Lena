@@ -712,8 +712,9 @@ function generarListaClientes(adminJid) {
         const n = i + 1;
         mapa[n] = datos.remoteJid;
 
-        // Nombre: usar el guardado o "Sin nombre"
-        const nombre = datos.nombre ? `*${datos.nombre}*` : '_Sin nombre_';
+        // Nombre: Gemini > pushName (nombre WhatsApp) > "Sin nombre"
+        const nombreTexto = datos.nombre || datos.pushName || null;
+        const nombre = nombreTexto ? `*${nombreTexto}*` : '_Sin nombre_';
 
         // Teléfono: usar el real si está disponible, o intentar resolver por lidToPhone
         const lidId = datos.remoteJid?.replace(/@.+$/, '');
@@ -758,17 +759,16 @@ function generarListaClientes(adminJid) {
 
 function buscarClientePorNombre(nombre) {
     const nombreLower = nombre.toLowerCase().trim();
-    // Primero buscar match exacto del primer nombre
+    const camposNombre = (datos) => [datos.nombre, datos.pushName].filter(Boolean).map(n => n.toLowerCase().trim());
+
+    // Match exacto en nombre o pushName
     const exacto = Object.entries(clientesHistorial).find(([, datos]) =>
-        datos.nombre && datos.nombre.toLowerCase().trim() === nombreLower
+        camposNombre(datos).some(n => n === nombreLower)
     );
     if (exacto) return exacto;
-    // Luego buscar match parcial (el nombre buscado está contenido en el nombre guardado o viceversa)
+    // Match parcial
     return Object.entries(clientesHistorial).find(([, datos]) =>
-        datos.nombre && (
-            datos.nombre.toLowerCase().includes(nombreLower) ||
-            nombreLower.includes(datos.nombre.toLowerCase().trim())
-        )
+        camposNombre(datos).some(n => n.includes(nombreLower) || nombreLower.includes(n.split(' ')[0]))
     );
 }
 
@@ -1566,6 +1566,18 @@ async function connectToWhatsApp() {
                         }
                         return;
                     }
+                }
+            }
+
+            // --- GUARDAR PUSHNAME (nombre WhatsApp del cliente) ---
+            // msg.pushName es el nombre que el cliente tiene configurado en su WhatsApp.
+            // Lo guardamos como fallback para identificar clientes @lid sin teléfono.
+            if (!msg.key.fromMe && msg.pushName) {
+                const clientePush = asegurarCliente(remoteJid);
+                if (!clientePush.pushName && msg.pushName) {
+                    clientePush.pushName = msg.pushName;
+                    saveHistorialGCS().catch(() => {});
+                    console.log(`📛 pushName guardado para ${remoteJid}: "${msg.pushName}"`);
                 }
             }
 
