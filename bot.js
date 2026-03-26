@@ -483,7 +483,8 @@ const ADMIN_JID = ADMIN_PHONE ? `${ADMIN_PHONE}@s.whatsapp.net` : null;
 // Configurar con env var ADMIN_SECRET o usa el default. Ej: "!vicky "
 const ADMIN_SECRET = (process.env.ADMIN_SECRET || '!vicky').toLowerCase().trim();
 // JIDs que se autenticaron como admin recientemente (válido 1 hora)
-const adminSesionesActivas = new Map(); // jid → timestamp de activación
+// Cada entrada: { activadoEn: timestamp, listaClientes: { 1: jid, 2: jid, ... } }
+const adminSesionesActivas = new Map();
 const ADMIN_SESSION_TTL = 60 * 60 * 1000; // 1 hora
 const UMBRAL_COLA_KG = 500; // Total acumulado en cola para disparar notificación al admin
 const LIMITE_INDIVIDUAL_KG = 200; // Pedidos > 200kg se entregan individual, ≤ 200kg van a cola grupal
@@ -636,36 +637,102 @@ async function agregarAColaLena(sock, remoteJid, nombre, direccion, zona, cantid
 // MODO ADMIN — Envío de mensajes puntuales a clientes
 // ============================================================
 const SYSTEM_PROMPT_ADMIN = `Sos el asistente interno de Vicky, el bot de Gardens Wood.
-El dueño del negocio te manda instrucciones por audio o texto para enviarle un mensaje puntual a un cliente.
-Tu trabajo es interpretar la instrucción y extraer:
-1. El nombre del cliente destinatario
-2. El mensaje exacto que hay que enviarle (redactado de forma natural, como si lo escribiera Vicky)
+El dueño del negocio te manda instrucciones por audio o texto para enviarle un mensaje puntual a un cliente, o para pedir información del sistema.
+Tu trabajo es interpretar la instrucción y responder SIEMPRE con uno de estos marcadores exactos, sin texto adicional:
 
-Respondé SIEMPRE con este formato exacto, sin texto adicional:
-[ENVIAR_A:NombreONumero|mensaje para el cliente]
+── MARCADORES DISPONIBLES ──
 
-Donde NombreONumero puede ser:
-- El nombre del cliente: "Juan", "María García"
-- Un número completo (con o sin código de país): "3512956376", "543512956376"
-- Los ÚLTIMOS 4 dígitos del número (cuando el admin dice "el que termina en..." o "finalizado en..."): escribilo como "*XXXX" (asterisco + 4 dígitos). Ejemplo: "termina en 6376" → "*6376"
+1. [LISTAR_CLIENTES]
+   Cuando el admin pide ver la lista de clientes, quién habló, mostrar contactos, etc.
+   Ejemplos: "Vicky lista", "mostrá los clientes", "quién habló último", "mostrame los contactos"
 
-Ejemplos:
-- Instrucción: "Mandá a Juan que su pedido de leña llega el martes"
-  → [ENVIAR_A:Juan|Hola Juan! Te cuento que tu pedido de leña llega el martes. Cualquier consulta avisame.]
-- Instrucción: "Mandá al que termina en 6376 que pasamos a medir el jueves"
-  → [ENVIAR_A:*6376|Hola! Confirmamos que pasamos a medir el jueves. Cualquier cambio avisame.]
-- Instrucción: "Avisale al finalizado en 0000 para retomar la cotización"
-  → [ENVIAR_A:*0000|Hola! Te escribo de Gardens Wood para retomar la consulta. ¿Seguís interesado?]
-- Instrucción: "Mandá al 3512956376 que pasamos a medir el jueves a las 10"
-  → [ENVIAR_A:3512956376|Hola! Confirmamos que pasamos a medir el jueves a las 10. Cualquier cambio avisame.]
+2. [ENVIAR_A:NombreONumero|mensaje para el cliente]
+   Cuando el admin quiere enviar un mensaje a un cliente específico por nombre o número.
+   NombreONumero puede ser:
+   - Nombre: "Juan", "María García"
+   - Número completo: "3512956376"
+   - Últimos 4 dígitos: "*6376" (cuando dice "termina en 6376" o "finalizado en 6376")
 
-Reglas:
-- Si el destinatario es un número, extraelo limpio (solo dígitos, sin espacios ni guiones).
-- Si el admin dice "termina en", "finalizado en", "el del número X", "últimos 4 dígitos X" → usá el formato *XXXX.
+3. [ENVIAR_A:#N|mensaje]
+   Cuando el admin hace referencia a un número de la lista previa ("el 2", "el tercero", "al número 1").
+   N es el número de posición en la lista. Ejemplo: "el 2, avisale que pasamos el jueves" → [ENVIAR_A:#2|Hola! Te avisamos que pasamos el jueves. Cualquier cambio avisame.]
+
+4. [ENVIAR_A:ULTIMO|mensaje]
+   Cuando el admin dice "el último que habló", "el más reciente", "el último cliente".
+
+5. [ENVIAR_A:ULTIMO_LENA|mensaje], [ENVIAR_A:ULTIMO_CERCO|mensaje], [ENVIAR_A:ULTIMO_PERGOLA|mensaje], [ENVIAR_A:ULTIMO_FOGONERO|mensaje]
+   Cuando el admin dice "el último que preguntó por leña/cerco/pérgola/fogonero".
+
+── EJEMPLOS ──
+- "Vicky lista" → [LISTAR_CLIENTES]
+- "Mostrá los clientes" → [LISTAR_CLIENTES]
+- "El 2, avisale que pasamos el jueves" → [ENVIAR_A:#2|Hola! Te avisamos que pasamos el jueves. Cualquier cambio avisame.]
+- "El tercero, decile que ya tenemos el presupuesto" → [ENVIAR_A:#3|Hola! Ya tenemos tu presupuesto listo. ¿Querés que te lo mande?]
+- "Mandá a Juan que su pedido de leña llega el martes" → [ENVIAR_A:Juan|Hola Juan! Te cuento que tu pedido de leña llega el martes. Cualquier consulta avisame.]
+- "El último que habló, avisale que lo llamamos" → [ENVIAR_A:ULTIMO|Hola! Te avisamos que te vamos a llamar en breve. Cualquier duda avisame.]
+- "El que preguntó por cerco, decile que ya tenemos el presupuesto" → [ENVIAR_A:ULTIMO_CERCO|Hola! Ya tenemos tu presupuesto de cerco listo. ¿Te lo mando?]
+- "Mandá al que termina en 6376 que pasamos a medir el jueves" → [ENVIAR_A:*6376|Hola! Confirmamos que pasamos a medir el jueves. Cualquier cambio avisame.]
+- "Mandá al 3512956376 que pasamos a medir el jueves a las 10" → [ENVIAR_A:3512956376|Hola! Confirmamos que pasamos a medir el jueves a las 10. Cualquier cambio avisame.]
+
+── REGLAS ──
+- Si el destinatario es un número, extraelo limpio (solo dígitos).
+- Si el admin dice "termina en", "finalizado en" → usá formato *XXXX.
 - El mensaje debe sonar natural, cálido, de parte de Gardens Wood.
-- Si la instrucción no es clara o no tiene destinatario, respondé solo: [ERROR:no entendí la instrucción, repetila más claro]
+- Si la instrucción no es clara, respondé: [ERROR:no entendí la instrucción, repetila más claro]
 - Si hay múltiples destinatarios, generá un [ENVIAR_A:...] por cada uno.
 - No agregues nada más fuera del/los marcadores.`;
+
+function generarListaClientes(adminJid) {
+    const ahora = Date.now();
+    const MS_HORA = 60 * 60 * 1000;
+    const MS_DIA = 24 * MS_HORA;
+
+    // Filtrar: excluir el propio admin y entradas sin JID real
+    const clientes = Object.entries(clientesHistorial)
+        .filter(([, datos]) => datos.remoteJid && datos.remoteJid !== adminJid)
+        .sort(([, a], [, b]) => {
+            // Ordenar por ultimoMensaje desc; si no tiene, al final
+            const ta = a.ultimoMensaje || 0;
+            const tb = b.ultimoMensaje || 0;
+            return tb - ta;
+        });
+
+    if (clientes.length === 0) {
+        return { texto: '📋 No hay clientes en el historial todavía.', mapa: {} };
+    }
+
+    const mapa = {};
+    const lineas = ['📋 *Clientes recientes:*'];
+
+    clientes.slice(0, 20).forEach(([, datos], i) => {
+        const n = i + 1;
+        mapa[n] = datos.remoteJid;
+
+        const nombre = datos.nombre || 'Sin nombre';
+        const tel = (datos.telefono || datos.remoteJid.replace(/@.+$/, '')).slice(-4);
+        const servicio = datos.servicioPendiente || datos.estado || '';
+        const servicioTag = servicio && servicio !== 'nuevo' ? ` — ${servicio}` : '';
+
+        let recencia = '';
+        if (datos.ultimoMensaje) {
+            const diff = ahora - datos.ultimoMensaje;
+            if (diff < MS_HORA) {
+                recencia = ` — hace ${Math.round(diff / 60000)}min`;
+            } else if (diff < MS_DIA) {
+                recencia = ` — hace ${Math.round(diff / MS_HORA)}h`;
+            } else if (diff < 7 * MS_DIA) {
+                recencia = ` — hace ${Math.round(diff / MS_DIA)}d`;
+            } else {
+                recencia = ` — hace ${Math.round(diff / (7 * MS_DIA))}sem`;
+            }
+        }
+
+        lineas.push(`${n}. *${nombre}* (…${tel})${servicioTag}${recencia}`);
+    });
+
+    lineas.push('\n_Respondé con el número: "el 2, avisale que..."_');
+    return { texto: lineas.join('\n'), mapa };
+}
 
 function buscarClientePorNombre(nombre) {
     const nombreLower = nombre.toLowerCase().trim();
@@ -716,7 +783,26 @@ async function procesarComandoAdmin(socket, adminJid, audioBase64, textoAdmin) {
             return;
         }
 
-        // Procesar cada [ENVIAR_A:nombre|mensaje]
+        // ── [LISTAR_CLIENTES] ──
+        if (/\[LISTAR_CLIENTES\]/i.test(respuesta)) {
+            const { texto, mapa } = generarListaClientes(adminJid);
+            const sesion = adminSesionesActivas.get(adminJid) || { activadoEn: Date.now(), listaClientes: {} };
+            sesion.listaClientes = mapa;
+            adminSesionesActivas.set(adminJid, sesion);
+            await responder(adminJid, { text: texto });
+            return;
+        }
+
+        // Helper: enviar a un JID concreto y confirmar al admin
+        const enviarYConfirmar = async (jidDestino, mensajeCliente, etiqueta) => {
+            await responder(jidDestino, { text: mensajeCliente });
+            console.log(`📤 Mensaje admin enviado a ${etiqueta} → ${jidDestino}`);
+            await responder(adminJid, {
+                text: `✅ Mensaje enviado a *${etiqueta}*:\n\n_"${mensajeCliente}"_`
+            });
+        };
+
+        // Procesar cada [ENVIAR_A:destinatario|mensaje]
         const regex = /\[ENVIAR_A:([^|]+)\|([^\]]+)\]/gi;
         let match;
         let alguno = false;
@@ -726,16 +812,57 @@ async function procesarComandoAdmin(socket, adminJid, audioBase64, textoAdmin) {
             const destinatario = match[1].trim();
             const mensajeCliente = match[2].trim();
 
-            // Caso 1: últimos 4 dígitos (*XXXX)
+            // ── Caso: selección por número de lista (#N) ──
+            const porNumero = destinatario.match(/^#(\d+)$/);
+            if (porNumero) {
+                const n = parseInt(porNumero[1], 10);
+                const sesion = adminSesionesActivas.get(adminJid);
+                const jidDestino = sesion?.listaClientes?.[n];
+                if (!jidDestino) {
+                    await responder(adminJid, {
+                        text: `❌ No encontré el cliente #${n}. Pedí la lista primero con *"Vicky lista"*.`
+                    });
+                } else {
+                    const datosCliente = getCliente(jidDestino) || {};
+                    const etiqueta = datosCliente.nombre || `#${n}`;
+                    await enviarYConfirmar(jidDestino, mensajeCliente, etiqueta);
+                }
+                continue;
+            }
+
+            // ── Caso: ULTIMO (el que habló más recientemente) ──
+            const ultimoMatch = destinatario.match(/^ULTIMO(?:_(\w+))?$/i);
+            if (ultimoMatch) {
+                const servicioFiltro = ultimoMatch[1]?.toLowerCase() || null;
+                const candidatos = Object.values(clientesHistorial)
+                    .filter(d => d.remoteJid && d.remoteJid !== adminJid && d.ultimoMensaje)
+                    .filter(d => {
+                        if (!servicioFiltro) return true;
+                        const sp = (d.servicioPendiente || '').toLowerCase();
+                        return sp.includes(servicioFiltro) || servicioFiltro.includes(sp.split(' ')[0]);
+                    })
+                    .sort((a, b) => b.ultimoMensaje - a.ultimoMensaje);
+                if (candidatos.length === 0) {
+                    const tag = servicioFiltro ? ` con servicio *${servicioFiltro}*` : '';
+                    await responder(adminJid, {
+                        text: `❌ No encontré ningún cliente${tag} con historial reciente.`
+                    });
+                } else {
+                    const d = candidatos[0];
+                    await enviarYConfirmar(d.remoteJid, mensajeCliente, d.nombre || d.remoteJid);
+                }
+                continue;
+            }
+
+            // ── Caso 1: últimos 4 dígitos (*XXXX) ──
             const esUltimos4 = destinatario.startsWith('*') && /^\*\d{4}$/.test(destinatario);
-            // Caso 2: número completo (8+ dígitos)
+            // ── Caso 2: número completo (8+ dígitos) ──
             const soloDigitos = destinatario.replace(/\D/g, '');
             const esNumeroCompleto = !esUltimos4 && soloDigitos.length >= 8;
 
             if (esUltimos4) {
-                const sufijo = destinatario.slice(1); // los 4 dígitos
+                const sufijo = destinatario.slice(1);
                 const resultado = Object.entries(clientesHistorial).find(([key, datos]) => {
-                    // Buscar en: clave del historial, teléfono guardado, remoteJid
                     const candidatos = [
                         key,
                         datos.telefono || '',
@@ -745,29 +872,20 @@ async function procesarComandoAdmin(socket, adminJid, audioBase64, textoAdmin) {
                 });
                 if (resultado) {
                     const [, datosCliente] = resultado;
-                    const jidReal = datosCliente.remoteJid; // usar el JID real guardado
                     const nombreReal = datosCliente.nombre || `...${sufijo}`;
-                    await responder(jidReal, { text: mensajeCliente });
-                    console.log(`📤 Mensaje admin enviado a ${nombreReal} (*${sufijo}) → ${jidReal}`);
-                    await responder(adminJid, {
-                        text: `✅ Mensaje enviado a *${nombreReal}* (terminado en ${sufijo}):\n\n_"${mensajeCliente}"_`
-                    });
+                    await enviarYConfirmar(datosCliente.remoteJid, mensajeCliente, `${nombreReal} (…${sufijo})`);
                 } else {
                     await responder(adminJid, {
                         text: `❌ No encontré ningún contacto con número terminado en *${sufijo}* en el historial.\n\nPasame el número completo y lo busco en WhatsApp.`
                     });
                 }
             } else if (esNumeroCompleto) {
-                // Normalizar: agregar código de país 54 (Argentina) si no lo tiene
                 let tel = soloDigitos;
                 if (!tel.startsWith('54') && tel.length <= 12) tel = '54' + tel;
-                // Verificar si el número existe en WhatsApp y obtener JID real
                 let jidCliente = null;
                 try {
                     const [info] = await socket.onWhatsApp(tel);
-                    if (info?.exists) {
-                        jidCliente = info.jid;
-                    }
+                    if (info?.exists) jidCliente = info.jid;
                 } catch (e) {
                     console.warn(`⚠️ No se pudo verificar número ${tel}:`, e.message);
                 }
@@ -776,28 +894,19 @@ async function procesarComandoAdmin(socket, adminJid, audioBase64, textoAdmin) {
                         text: `❌ El número *${soloDigitos}* no está registrado en WhatsApp o no se pudo verificar.`
                     });
                 } else {
-                    await responder(jidCliente, { text: mensajeCliente });
-                    console.log(`📤 Mensaje admin enviado a ${tel} (JID: ${jidCliente})`);
-                    await responder(adminJid, {
-                        text: `✅ Mensaje enviado al *${soloDigitos}*:\n\n_"${mensajeCliente}"_`
-                    });
+                    await enviarYConfirmar(jidCliente, mensajeCliente, soloDigitos);
                 }
             } else {
-                // Buscar por nombre en el historial
+                // ── Buscar por nombre ──
                 const resultado = buscarClientePorNombre(destinatario);
                 if (resultado) {
-                    const [jidCliente, datosCliente] = resultado;
+                    const [, datosCliente] = resultado;
                     const nombreReal = datosCliente.nombre || destinatario;
-                    await responder(jidCliente, { text: mensajeCliente });
-                    console.log(`📤 Mensaje admin enviado a ${nombreReal} (${jidCliente})`);
-                    const telCorto = jidCliente.replace('@s.whatsapp.net', '').replace('@lid', '');
-                    await responder(adminJid, {
-                        text: `✅ Mensaje enviado a *${nombreReal}* (${telCorto}):\n\n_"${mensajeCliente}"_`
-                    });
+                    await enviarYConfirmar(datosCliente.remoteJid, mensajeCliente, nombreReal);
                 } else {
                     console.warn(`⚠️ Cliente "${destinatario}" no encontrado en historial`);
                     await responder(adminJid, {
-                        text: `❌ No encontré a *${destinatario}* en el historial.\n\nPodés decirme los últimos 4 dígitos del número (_"el que termina en 6376"_) o el número completo.`
+                        text: `❌ No encontré a *${destinatario}* en el historial.\n\nPodés usar:\n• *"Vicky lista"* para ver los clientes numerados\n• *"el que termina en 6376"* si sabés los últimos 4 dígitos\n• El número completo`
                     });
                 }
             }
@@ -1110,6 +1219,7 @@ function actualizarEstadoCliente(remoteJid, datos) {
     if (datos.direccion) cliente.direccion = datos.direccion;
     if (datos.zona) cliente.zona = datos.zona;
     if (datos.metodoPago) cliente.metodoPago = datos.metodoPago;
+    if (datos.ultimoMensaje) cliente.ultimoMensaje = datos.ultimoMensaje;
     if (datos.pedido) {
         if (!cliente.pedidosAnteriores) cliente.pedidosAnteriores = [];
         cliente.pedidosAnteriores.push(datos.pedido);
@@ -1329,13 +1439,18 @@ async function connectToWhatsApp() {
                 const esFraseAdmin = textoRaw.toLowerCase().trim().startsWith(ADMIN_SECRET);
 
                 // Verificar si el JID ya tiene sesión admin activa (activada con !vicky en los últimos 60min)
-                const sesionAdminActiva = adminSesionesActivas.has(remoteJid) &&
-                    (Date.now() - adminSesionesActivas.get(remoteJid)) < ADMIN_SESSION_TTL;
+                const sesionAdminData = adminSesionesActivas.get(remoteJid);
+                const sesionAdminActiva = sesionAdminData &&
+                    (Date.now() - sesionAdminData.activadoEn) < ADMIN_SESSION_TTL;
 
                 if (esJidAdmin || esFraseAdmin || sesionAdminActiva) {
                     // Si llegó la frase secreta por texto, activar/renovar sesión admin para este JID
                     if (esFraseAdmin || esJidAdmin) {
-                        adminSesionesActivas.set(remoteJid, Date.now());
+                        const existing = adminSesionesActivas.get(remoteJid) || {};
+                        adminSesionesActivas.set(remoteJid, {
+                            activadoEn: Date.now(),
+                            listaClientes: existing.listaClientes || {}
+                        });
                         console.log(`🔑 Sesión admin activada para ${remoteJid} (válida 1 hora)`);
                     }
 
@@ -1462,6 +1577,8 @@ async function connectToWhatsApp() {
                 ? Math.round((ahora - session.ultimoMensajeCliente) / 60000)
                 : null;
             session.ultimoMensajeCliente = ahora;
+            // Persistir en historial GCS para poder ordenar lista de clientes por recencia
+            actualizarEstadoCliente(remoteJid, { ultimoMensaje: ahora });
 
             // Contador de mensajes de texto consecutivos (reset si manda audio)
             if (tieneAudio) {
