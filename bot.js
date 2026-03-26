@@ -1500,7 +1500,10 @@ async function connectToWhatsApp() {
             }
 
             // --- AUDIO DE BIENVENIDA (solo la primera vez por cliente, para siempre) ---
-            if (!session.audioIntroEnviado) {
+            // primerMensajeConContenido: si el cliente ya incluyó info en su primer mensaje,
+            // NO cortamos con return — dejamos que Gemini responda a lo que preguntó.
+            const primerContacto = !session.audioIntroEnviado;
+            if (primerContacto) {
                 session.audioIntroEnviado = true;
                 marcarAudioEnviado(remoteJid);
 
@@ -1517,10 +1520,24 @@ async function connectToWhatsApp() {
                         console.error('❌ Error enviando audio:', errAudio.message);
                     }
                 }
+
+                // Si el primer mensaje solo es un saludo vacío (sin contenido relevante),
+                // enviamos el mensaje de bienvenida y esperamos su respuesta.
+                const esTextoVago = !text || /^(hola|buenas|buen[ao]s?\s*(días?|tardes?|noches?)?|hey|hi|hello|saludos?|buenas?|ey|q tal|como andas?)\s*[!?¡¿.]*$/i.test(text.trim());
+                if (esTextoVago && !tieneImagen && !tieneAudio) {
+                    await sendBotMessage(remoteJid, {
+                        text: `Contame, ¿en qué te puedo ayudar? Escribime porfa que me es más fácil responder 😊`
+                    });
+                    return;
+                }
+
+                // Si el cliente ya trajo info en su primer mensaje (ej: "10mt de cerco cuánto cuesta"),
+                // enviamos solo el mensaje invitándolo a escribir y luego dejamos que Gemini procese su consulta.
                 await sendBotMessage(remoteJid, {
                     text: `Contame, ¿en qué te puedo ayudar? Escribime porfa que me es más fácil responder 😊`
                 });
-                return;
+                await delay(1000);
+                // Caemos al bloque de Gemini con contexto especial de que es el primer mensaje.
             }
 
             // --- CONSULTAR GEMINI ---
@@ -1540,11 +1557,18 @@ async function connectToWhatsApp() {
                 });
 
                 // Contexto de tiempo para que Gemini sepa si saludar o no
-                const ctxSaludo = minutosDesdeUltimoMensaje === null
-                    ? '[CONTEXTO: Es el primer mensaje de esta sesión activa. Podés saludar.]'
-                    : minutosDesdeUltimoMensaje >= 60
-                        ? `[CONTEXTO: El cliente no escribía hace ${minutosDesdeUltimoMensaje} minutos. Podés saludar brevemente.]`
-                        : `[CONTEXTO: La charla es fluida, el último mensaje fue hace ${minutosDesdeUltimoMensaje} minutos. NO saludes de nuevo, continuá la conversación directamente.]`;
+                let ctxSaludo;
+                if (primerContacto) {
+                    // El audio de bienvenida ya fue enviado junto con "Contame en qué te puedo ayudar".
+                    // Gemini NO debe saludar de nuevo ni repetir esa frase. Debe responder directo al contenido.
+                    ctxSaludo = `[CONTEXTO: El audio y el mensaje de bienvenida ya fueron enviados en este mismo instante. NO saludes, NO digas "Hola", "Buenas", "Contame" ni nada similar. El cliente te escribió con una consulta específica. Respondé DIRECTAMENTE a lo que preguntó, como si ya estuvieras en medio de la conversación.]`;
+                } else if (minutosDesdeUltimoMensaje === null) {
+                    ctxSaludo = '[CONTEXTO: Es el primer mensaje de esta sesión activa. Podés saludar.]';
+                } else if (minutosDesdeUltimoMensaje >= 60) {
+                    ctxSaludo = `[CONTEXTO: El cliente no escribía hace ${minutosDesdeUltimoMensaje} minutos. Podés saludar brevemente.]`;
+                } else {
+                    ctxSaludo = `[CONTEXTO: La charla es fluida, el último mensaje fue hace ${minutosDesdeUltimoMensaje} minutos. NO saludes de nuevo, continuá la conversación directamente.]`;
+                }
 
                 // Indicar si corresponde intercalar un audio de fidelización (cada 4 mensajes de texto)
                 const mensajesTextoActual = session.mensajesTexto || 0;
