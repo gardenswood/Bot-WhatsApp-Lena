@@ -1698,12 +1698,91 @@ async function connectToWhatsApp() {
                             }
 
                             try {
-                                const mensajeRedactado = await redactarMensajeAdmin(audioAdminBase64, instruccionTexto);
-                                await socket.sendMessage(jidDestino, { text: mensajeRedactado });
+                                // Usar Gemini con el SYSTEM_PROMPT de Vicky para que interprete
+                                // la instrucción del admin y genere la respuesta completa al cliente
+                                // (puede incluir catálogos, imágenes, info de servicios, etc.)
+                                if (!geminiModel) throw new Error('Gemini no inicializado');
+
+                                const ctxAdmin = `[INSTRUCCION_ADMIN] El dueño del negocio quiere que le envíes la siguiente información/mensaje al cliente. Respondé como Vicky, directamente. No saludes (el cliente ya te conoce). Usá los marcadores habituales si corresponde ([IMG:xxx] para catálogos, etc.).`;
+                                let partesAdmin;
+                                if (audioAdminBase64) {
+                                    partesAdmin = [
+                                        { text: ctxAdmin },
+                                        { inlineData: { data: audioAdminBase64, mimeType: 'audio/ogg' } },
+                                        { text: 'Transcribí el audio y generá la respuesta para el cliente.' }
+                                    ];
+                                } else {
+                                    partesAdmin = [{ text: `${ctxAdmin}\nInstrucción: ${instruccionTexto}` }];
+                                }
+
+                                const chatAdmin = geminiModel.startChat({ history: [] });
+                                const resultAdmin = await chatAdmin.sendMessage(partesAdmin);
+                                let respuestaAdmin = resultAdmin.response.text().trim();
+                                console.log(`🔑 Respuesta Gemini 2-pasos: ${respuestaAdmin.substring(0, 120)}`);
+
+                                // Procesar [IMG:xxx] → enviar imagen/video del catálogo
+                                const imgMatchAdmin = respuestaAdmin.match(/\[IMG:(lena|cerco|pergola|fogonero|bancos)\]/i);
+                                respuestaAdmin = respuestaAdmin.replace(/\[IMG:(lena|cerco|pergola|fogonero|bancos)\]/gi, '').trim();
+
+                                // Procesar [PDF_CERCO:metros|precioUnit|alturaM|descuentoPct]
+                                const pdfAdminMatch = respuestaAdmin.match(/\[PDF_CERCO:([^\]]+)\]/i);
+                                respuestaAdmin = respuestaAdmin.replace(/\[PDF_CERCO:[^\]]+\]/gi, '').trim();
+
+                                // Limpiar otros marcadores internos que no aplican al envío directo
+                                respuestaAdmin = respuestaAdmin
+                                    .replace(/\[COTIZACION:[^\]]+\]/gi, '')
+                                    .replace(/\[CONFIRMADO\]/gi, '')
+                                    .replace(/\[NOMBRE:[^\]]+\]/gi, '')
+                                    .replace(/\[DIRECCION:[^\]]+\]/gi, '')
+                                    .replace(/\[ZONA:[^\]]+\]/gi, '')
+                                    .replace(/\[METODO_PAGO:[^\]]+\]/gi, '')
+                                    .replace(/\[PEDIDO:[^\]]+\]/gi, '')
+                                    .replace(/\[PEDIDO_LENA:[^\]]+\]/gi, '')
+                                    .replace(/\[AUDIO_CORTO:[^\]]+\]/gi, '')
+                                    .replace(/\[AUDIO_FIDELIZAR:[^\]]+\]/gi, '')
+                                    .trim();
+
+                                // Enviar texto al cliente
+                                if (respuestaAdmin.length > 0) {
+                                    await sendBotMessage(jidDestino, { text: respuestaAdmin });
+                                }
+
+                                // Enviar imagen/video del catálogo si corresponde
+                                if (imgMatchAdmin) {
+                                    await enviarImagen(jidDestino, imgMatchAdmin[1].toLowerCase());
+                                }
+
+                                // Generar y enviar PDF de cerco si corresponde
+                                if (pdfAdminMatch) {
+                                    const partesPdf = pdfAdminMatch[1].split('|');
+                                    const metros = parseFloat(partesPdf[0]) || 0;
+                                    const precioUnit = parseFloat(partesPdf[1]) || 0;
+                                    const alturaM = partesPdf[2] || '1.8';
+                                    const descuentoPct = parseFloat(partesPdf[3]) || 0;
+                                    const nombreClientePdf = getCliente(jidDestino)?.nombre || etiqueta;
+                                    if (metros > 0 && precioUnit > 0) {
+                                        generarPresupuestoCercoPDF({ cliente: nombreClientePdf, metros, precioUnit, alturaM, descuentoPct })
+                                            .then(async (pdfPath) => {
+                                                if (pdfPath) {
+                                                    await sendBotMessage(jidDestino, {
+                                                        document: fs.readFileSync(pdfPath),
+                                                        mimetype: 'application/pdf',
+                                                        fileName: `Presupuesto Cerco - ${nombreClientePdf}.pdf`
+                                                    });
+                                                    fs.unlinkSync(pdfPath);
+                                                }
+                                            }).catch(err => console.error('❌ Error PDF cerco 2-pasos:', err.message));
+                                    }
+                                }
+
                                 console.log(`📤 Mensaje 2-pasos enviado a ${etiqueta} (${jidDestino})`);
+                                const resumen = respuestaAdmin.length > 0
+                                    ? `\n\n_"${respuestaAdmin.substring(0, 120)}${respuestaAdmin.length > 120 ? '…' : ''}"_`
+                                    : (imgMatchAdmin ? `\n\n_[imagen de ${imgMatchAdmin[1]}]_` : '');
                                 await sendBotMessage(remoteJid, {
-                                    text: `✅ Mensaje enviado a *${etiqueta}*:\n\n_"${mensajeRedactado}"_`
+                                    text: `✅ Enviado a *${etiqueta}*${resumen}`
                                 });
+
                                 // Limpiar destinatario para el próximo envío
                                 sesion.destinatarioPendiente = null;
                             } catch (err) {
