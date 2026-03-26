@@ -702,35 +702,46 @@ function generarListaClientes(adminJid) {
     }
 
     const mapa = {};
-    const lineas = ['📋 *Clientes recientes:*'];
+    const lineas = ['📋 *Clientes recientes:*', ''];
 
-    clientes.slice(0, 20).forEach(([, datos], i) => {
+    clientes.slice(0, 15).forEach(([, datos], i) => {
         const n = i + 1;
         mapa[n] = datos.remoteJid;
 
-        const nombre = datos.nombre || 'Sin nombre';
-        const tel = (datos.telefono || datos.remoteJid.replace(/@.+$/, '')).slice(-4);
-        const servicio = datos.servicioPendiente || datos.estado || '';
-        const servicioTag = servicio && servicio !== 'nuevo' ? ` — ${servicio}` : '';
+        // Nombre: usar el guardado o "Sin nombre"
+        const nombre = datos.nombre ? `*${datos.nombre}*` : '_Sin nombre_';
 
-        let recencia = '';
+        // Teléfono: mostrar los últimos 8 dígitos para que sea identificable
+        const telRaw = datos.telefono || datos.remoteJid.replace(/@.+$/, '');
+        const telMostrar = telRaw.length > 8 ? `…${telRaw.slice(-8)}` : telRaw;
+
+        // Servicio / estado
+        const servicio = datos.servicioPendiente || '';
+        const estado = datos.estado && datos.estado !== 'nuevo' ? datos.estado : '';
+        const servicioTag = servicio ? ` | ${servicio}` : (estado ? ` | ${estado}` : '');
+
+        // Recencia
+        let recencia = 'sin actividad';
         if (datos.ultimoMensaje) {
             const diff = ahora - datos.ultimoMensaje;
             if (diff < MS_HORA) {
-                recencia = ` — hace ${Math.round(diff / 60000)}min`;
+                recencia = `hace ${Math.round(diff / 60000)}min`;
             } else if (diff < MS_DIA) {
-                recencia = ` — hace ${Math.round(diff / MS_HORA)}h`;
+                recencia = `hace ${Math.round(diff / MS_HORA)}h`;
             } else if (diff < 7 * MS_DIA) {
-                recencia = ` — hace ${Math.round(diff / MS_DIA)}d`;
+                recencia = `hace ${Math.round(diff / MS_DIA)}d`;
             } else {
-                recencia = ` — hace ${Math.round(diff / (7 * MS_DIA))}sem`;
+                recencia = `hace ${Math.round(diff / (7 * MS_DIA))}sem`;
             }
         }
 
-        lineas.push(`${n}. *${nombre}* (…${tel})${servicioTag}${recencia}`);
+        lineas.push(`*${n}.* ${nombre}`);
+        lineas.push(`    📱 ${telMostrar}${servicioTag}`);
+        lineas.push(`    🕐 ${recencia}`);
+        lineas.push('');
     });
 
-    lineas.push('\n_Respondé con el número: "el 2, avisale que..."_');
+    lineas.push('_Decí "el 2, avisale que..." o "mandá al 3 que..."_');
     return { texto: lineas.join('\n'), mapa };
 }
 
