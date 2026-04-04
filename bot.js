@@ -813,6 +813,8 @@ let waReconnectTimer = null;
 
 /** Socket Baileys activo (cada reconexión asigna el nuevo; evita enviar con socket cerrado). */
 const vickySocketRef = { current: null };
+/** Sondeo de `entregas_agenda` pendientes de aviso al grupo WA (altas desde panel). */
+let agendaGrupoNotifyInterval = null;
 /** Firestore + Gemini + delays: solo la primera vez; reconexiones solo recrean el socket. */
 let vickyBootstrapHecho = false;
 let vickyGeminiModel = null;
@@ -837,6 +839,10 @@ const vickyRuntimeCfg = {
     CAMPANA_DESC_PCT: 10,
     /** Modelo Gemini (se setea en bootstrap). */
     MODEL_GEMINI: 'gemini-2.5-flash',
+    /** JID grupo WhatsApp para avisos de nuevas filas en agenda de entregas (…@g.us). */
+    GRUPO_JID_AGENDA_ENTREGAS: '',
+    /** Panel `config/general` o default true. */
+    NOTIFICAR_AGENDA_GRUPO_ACTIVO: true,
 };
 let vickySeguimientoIniciado = false;
 
@@ -886,6 +892,78 @@ async function sendBotMessage(jid, content) {
     } catch (e) {
         console.warn('⚠️ sendBotMessage:', e.message);
         return null;
+    }
+}
+
+function normalizarJidGrupoAgendaEntregas(raw) {
+    const s = String(raw || '').trim().replace(/\s/g, '');
+    if (!s) return '';
+    if (s.endsWith('@g.us')) return s;
+    return '';
+}
+
+function textoNotificacionEntregaAgendaEnGrupo(docId, d) {
+    if (!d || typeof d !== 'object') return `📅 *Agenda de entregas* — id \`${docId}\``;
+    const lines = ['📅 *Nueva entrada en agenda de entregas*', ''];
+    if (d.fechaDia) lines.push(`📆 Día: *${String(d.fechaDia)}*`);
+    if (d.horaTexto) lines.push(`🕐 Hora: ${String(d.horaTexto)}`);
+    lines.push(`📝 ${String(d.titulo || '—').slice(0, 400)}`);
+    if (d.origen) lines.push(`📎 Origen: _${String(d.origen)}_`);
+    if (d.telefonoContacto) lines.push(`📞 Contacto: \`${String(d.telefonoContacto)}\``);
+    if (d.direccion) lines.push(`📍 ${String(d.direccion).slice(0, 220)}`);
+    if (d.producto) lines.push(`📦 ${String(d.producto).slice(0, 220)}`);
+    if (d.notas) lines.push(`ℹ️ ${String(d.notas).slice(0, 280)}`);
+    if (d.jid) lines.push(`💬 Chat: \`${String(d.jid)}\``);
+    lines.push('', `\`id:${docId}\``);
+    return lines.join('\n').slice(0, 3800);
+}
+
+async function leerConfigNotificacionGrupoAgendaEntregas() {
+    if (!firestoreModule.isAvailable()) {
+        const jid = normalizarJidGrupoAgendaEntregas(process.env.WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS);
+        return { activo: true, grupoJid: jid };
+    }
+    const cfg = await firestoreModule.getConfigGeneral();
+    const jid = normalizarJidGrupoAgendaEntregas(
+        cfg.whatsappGrupoJidAgendaEntregas || process.env.WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS
+    );
+    const activo = cfg.notificarAgendaEntregasGrupoActivo !== false;
+    return { activo, grupoJid: jid };
+}
+
+async function intentarNotificarNuevaEntregaAgendaGrupo(docId) {
+    if (!docId || !firestoreModule.isAvailable()) return;
+    if (!vickySocketRef.current) return;
+    const { activo, grupoJid } = await leerConfigNotificacionGrupoAgendaEntregas();
+    vickyRuntimeCfg.GRUPO_JID_AGENDA_ENTREGAS = grupoJid;
+    vickyRuntimeCfg.NOTIFICAR_AGENDA_GRUPO_ACTIVO = activo;
+    if (!activo || !grupoJid) return;
+    const claimed = await firestoreModule.claimEntregaAgendaNotificacionGrupo(docId);
+    if (!claimed) return;
+    const d = await firestoreModule.getEntregaAgendaDocData(docId);
+    if (!d) {
+        await firestoreModule.revertEntregaAgendaNotificacionGrupo(docId);
+        return;
+    }
+    const text = textoNotificacionEntregaAgendaEnGrupo(docId, d);
+    const sent = await sendBotMessage(grupoJid, { text });
+    if (!sent) {
+        await firestoreModule.revertEntregaAgendaNotificacionGrupo(docId);
+        console.warn(
+            `⚠️ No se pudo enviar notificación de agenda al grupo (${String(grupoJid).slice(0, 32)}…); doc ${docId} queda pendiente.`
+        );
+    } else {
+        console.log(`📣 Agenda entregas → grupo WA (${docId})`);
+    }
+}
+
+async function procesarPendientesNotificacionAgendaGrupo() {
+    if (!firestoreModule.isAvailable() || !vickySocketRef.current) return;
+    const { activo, grupoJid } = await leerConfigNotificacionGrupoAgendaEntregas();
+    if (!activo || !grupoJid) return;
+    const ids = await firestoreModule.listEntregaAgendaIdsPendientesNotificarGrupo(12);
+    for (const id of ids) {
+        await intentarNotificarNuevaEntregaAgendaGrupo(id);
     }
 }
 
@@ -3666,6 +3744,20 @@ async function connectToWhatsApp(isReconnect = false) {
                 `📦 Notificación datos de entrega → WhatsApp ${vickyRuntimeCfg.DATOS_ENTREGA_NOTIFY_DIGITS.slice(0, 4)}… (origen: ${tienePanelDe ? 'panel' : 'env/default'})`
             );
         }
+        const gjAgenda = normalizarJidGrupoAgendaEntregas(
+            configGeneral.whatsappGrupoJidAgendaEntregas || process.env.WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS
+        );
+        vickyRuntimeCfg.GRUPO_JID_AGENDA_ENTREGAS = gjAgenda;
+        vickyRuntimeCfg.NOTIFICAR_AGENDA_GRUPO_ACTIVO = configGeneral.notificarAgendaEntregasGrupoActivo !== false;
+        if (String(configGeneral.whatsappGrupoJidAgendaEntregas || '').trim() || process.env.WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS) {
+            if (gjAgenda.endsWith('@g.us')) {
+                console.log(`📣 Agenda entregas: avisos al grupo WA (${gjAgenda.slice(0, 36)}…)`);
+            } else {
+                console.warn(
+                    '⚠️ whatsappGrupoJidAgendaEntregas / WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS debe ser JID completo terminado en @g.us (ej. 120363…@g.us).'
+                );
+            }
+        }
         const cMin = Number(configGeneral.campanaDelayMinSeg);
         const cMax = Number(configGeneral.campanaDelayMaxSeg);
         vickyRuntimeCfg.CAMPANA_DELAY_MIN_MS = Math.max(5000, (Number.isFinite(cMin) ? cMin : 15) * 1000);
@@ -3891,6 +3983,11 @@ async function connectToWhatsApp(isReconnect = false) {
             qrImage.image(qr, { type: 'png', size: 4 }).pipe(fs.createWriteStream('qr.png'));
         }
         if (connection === 'close') {
+            if (agendaGrupoNotifyInterval) {
+                clearInterval(agendaGrupoNotifyInterval);
+                agendaGrupoNotifyInterval = null;
+            }
+            firestoreModule.setEntregaAgendaPostAddHook(null);
             if (credsUploadTimer) {
                 clearTimeout(credsUploadTimer);
                 credsUploadTimer = null;
@@ -3923,6 +4020,15 @@ async function connectToWhatsApp(isReconnect = false) {
                 console.log('\n🏷️ VICKY_LOG_LABELS activo: buscá en consola líneas "id=… name=…".');
                 console.log('   Si no sale nada al minuto: en WhatsApp Business renombrá la etiqueta o asignala a un chat (fuerza sincronización).\n');
             }
+            firestoreModule.setEntregaAgendaPostAddHook((id) => {
+                void intentarNotificarNuevaEntregaAgendaGrupo(id);
+            });
+            if (!agendaGrupoNotifyInterval) {
+                agendaGrupoNotifyInterval = setInterval(() => {
+                    void procesarPendientesNotificacionAgendaGrupo();
+                }, 50000);
+            }
+            void procesarPendientesNotificacionAgendaGrupo();
         }
     });
 

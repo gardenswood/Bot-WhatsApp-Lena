@@ -279,6 +279,10 @@ async function getConfigGeneral(opts) {
         geocodeCronActivo: true,
         /** Máximo de fichas a geocodificar por ejecución del cron (1–80 en servidor). */
         geocodeCronMaxPorEjecucion: 30,
+        /** JID del grupo WA (…@g.us) donde avisar cada alta en `entregas_agenda`. Vacío = desactivado. */
+        whatsappGrupoJidAgendaEntregas: '',
+        /** Si es false, no se envía mensaje al grupo aunque haya JID (panel General). */
+        notificarAgendaEntregasGrupoActivo: true,
     };
 
     if (!firestoreDb) return DEFAULT_CONFIG;
@@ -1780,6 +1784,12 @@ function validarFechaDiaAgenda(s) {
     return Number.isFinite(t);
 }
 
+/** Tras crear doc en `entregas_agenda` (bot); el proceso host envía WA al grupo. */
+let entregaAgendaPostAddHook = null;
+function setEntregaAgendaPostAddHook(fn) {
+    entregaAgendaPostAddHook = typeof fn === 'function' ? fn : null;
+}
+
 async function addEntregaAgenda({
     jid,
     fechaDia,
@@ -1818,11 +1828,86 @@ async function addEntregaAgenda({
             origen: origen || 'bot',
             estado: 'pendiente',
             creadoEn: FieldValue.serverTimestamp(),
+            /** false hasta que el bot confirme envío al grupo WA (evita duplicados entre réplicas). */
+            notificadoGrupoAgenda: false,
         });
-        return ref.id;
+        const newId = ref.id;
+        if (entregaAgendaPostAddHook && newId) {
+            Promise.resolve(entregaAgendaPostAddHook(newId)).catch((e) =>
+                console.warn('⚠️ entregaAgendaPostAddHook:', e?.message || e)
+            );
+        }
+        return newId;
     } catch (e) {
         console.warn('⚠️ addEntregaAgenda:', e.message);
         return null;
+    }
+}
+
+/**
+ * Transacción: marca como notificado solo si aún era false (una sola réplica envía).
+ * @returns {Promise<boolean>}
+ */
+async function claimEntregaAgendaNotificacionGrupo(docId) {
+    if (!firestoreDb || !docId) return false;
+    const admin = require('firebase-admin');
+    const ref = firestoreDb.collection('entregas_agenda').doc(docId);
+    try {
+        return await firestoreDb.runTransaction(async (t) => {
+            const snap = await t.get(ref);
+            if (!snap.exists) return false;
+            const d = snap.data() || {};
+            if (d.notificadoGrupoAgenda === true) return false;
+            t.update(ref, {
+                notificadoGrupoAgenda: true,
+                notificadoGrupoAgendaEn: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            return true;
+        });
+    } catch (e) {
+        console.warn('⚠️ claimEntregaAgendaNotificacionGrupo:', e.message);
+        return false;
+    }
+}
+
+async function revertEntregaAgendaNotificacionGrupo(docId) {
+    if (!firestoreDb || !docId) return;
+    const admin = require('firebase-admin');
+    try {
+        await firestoreDb.collection('entregas_agenda').doc(docId).update({
+            notificadoGrupoAgenda: false,
+            notificadoGrupoAgendaEn: admin.firestore.FieldValue.delete(),
+        });
+    } catch (e) {
+        console.warn('⚠️ revertEntregaAgendaNotificacionGrupo:', e.message);
+    }
+}
+
+async function getEntregaAgendaDocData(docId) {
+    if (!firestoreDb || !docId) return null;
+    try {
+        const snap = await firestoreDb.collection('entregas_agenda').doc(docId).get();
+        if (!snap.exists) return null;
+        return snap.data() || null;
+    } catch (e) {
+        console.warn('⚠️ getEntregaAgendaDocData:', e.message);
+        return null;
+    }
+}
+
+/** IDs con notificadoGrupoAgenda == false (altas desde panel u omitidas por socket cerrado). */
+async function listEntregaAgendaIdsPendientesNotificarGrupo(limit = 12) {
+    if (!firestoreDb) return [];
+    try {
+        const snap = await firestoreDb
+            .collection('entregas_agenda')
+            .where('notificadoGrupoAgenda', '==', false)
+            .limit(Math.min(25, Math.max(1, limit)))
+            .get();
+        return snap.docs.map((d) => d.id);
+    } catch (e) {
+        console.warn('⚠️ listEntregaAgendaIdsPendientesNotificarGrupo:', e.message);
+        return [];
     }
 }
 
@@ -2268,6 +2353,11 @@ module.exports = {
     addEntregaAgenda,
     updateEntregaAgendaEstado,
     getTextoEntregaAgendaListaAdmin,
+    setEntregaAgendaPostAddHook,
+    claimEntregaAgendaNotificacionGrupo,
+    revertEntregaAgendaNotificacionGrupo,
+    getEntregaAgendaDocData,
+    listEntregaAgendaIdsPendientesNotificarGrupo,
     saveLidMapeo,
     loadLidMapeoIntoMap,
     addDatosEntregaRegistro,
