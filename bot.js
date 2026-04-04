@@ -921,6 +921,49 @@ function normalizarJidGrupoAgendaEntregas(raw) {
     return `${localPart}@g.us`;
 }
 
+/** Extrae código de invitación desde URL `chat.whatsapp.com/…` o cadena suelta (sin JID). */
+function extraerCodigoInvitacionGrupoWhatsapp(raw) {
+    const t = String(raw || '').trim();
+    if (!t) return '';
+    if (t.includes('@g.us')) return '';
+    const fromUrl = t.match(/chat\.whatsapp\.com\/([A-Za-z0-9_-]+)/i);
+    if (fromUrl) return fromUrl[1].replace(/[?#].*$/, '');
+    if (/^[A-Za-z0-9_-]{10,48}$/.test(t)) return t;
+    return '';
+}
+
+/** Caché en memoria: mismo texto de panel/env → no llamar groupGetInviteInfo cada 50 s. */
+let agendaGrupoInviteResolveCache = { key: '', jid: '' };
+
+/**
+ * JID …@g.us operativo: normaliza o resuelve enlace/código con Baileys (`groupGetInviteInfo`).
+ */
+async function resolverJidGrupoAgendaOperativo(raw, sock) {
+    const prelim = normalizarJidGrupoAgendaEntregas(raw);
+    if (prelim) return prelim;
+    const r = String(raw || '').trim();
+    if (!r) return '';
+    if (agendaGrupoInviteResolveCache.key === r && agendaGrupoInviteResolveCache.jid) {
+        return agendaGrupoInviteResolveCache.jid;
+    }
+    const code = extraerCodigoInvitacionGrupoWhatsapp(r);
+    if (!code || !sock || typeof sock.groupGetInviteInfo !== 'function') return '';
+    try {
+        const meta = await sock.groupGetInviteInfo(code);
+        const jid = normalizarJidGrupoAgendaEntregas(meta?.id || '');
+        if (jid) {
+            agendaGrupoInviteResolveCache = { key: r, jid };
+            console.log(
+                `[agenda-grupo] Enlace/código de invitación resuelto a JID ${jid.slice(0, 28)}… (podés reemplazar en panel por este JID para no depender del enlace).`
+            );
+        }
+        return jid;
+    } catch (e) {
+        console.warn('[agenda-grupo] groupGetInviteInfo (invitación):', e?.message || e);
+        return '';
+    }
+}
+
 function textoNotificacionEntregaAgendaEnGrupo(docId, d) {
     if (!d || typeof d !== 'object') return `📅 *Agenda de entregas* — id \`${docId}\``;
     const lines = ['📅 *Nueva entrada en agenda de entregas*', ''];
@@ -939,16 +982,16 @@ function textoNotificacionEntregaAgendaEnGrupo(docId, d) {
 
 async function leerConfigNotificacionGrupoAgendaEntregas() {
     if (!firestoreModule.isAvailable()) {
-        const jid = normalizarJidGrupoAgendaEntregas(process.env.WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS);
-        return { activo: true, grupoJid: jid };
+        const raw = String(process.env.WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS || '').trim();
+        const jid = normalizarJidGrupoAgendaEntregas(raw);
+        return { activo: true, grupoJid: jid, rawGrupoConfig: raw };
     }
     // Sin caché: el JID del grupo suele guardarse después del arranque; el cache 5 min de getConfigGeneral dejaba grupoJid vacío.
     const cfg = await firestoreModule.getConfigGeneral({ bypassCache: true });
-    const jid = normalizarJidGrupoAgendaEntregas(
-        cfg.whatsappGrupoJidAgendaEntregas || process.env.WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS
-    );
+    const raw = String(cfg.whatsappGrupoJidAgendaEntregas || process.env.WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS || '').trim();
+    const jid = normalizarJidGrupoAgendaEntregas(raw);
     const activo = cfg.notificarAgendaEntregasGrupoActivo !== false;
-    return { activo, grupoJid: jid };
+    return { activo, grupoJid: jid, rawGrupoConfig: raw };
 }
 
 async function intentarNotificarNuevaEntregaAgendaGrupo(docId, opts = {}) {
@@ -962,7 +1005,10 @@ async function intentarNotificarNuevaEntregaAgendaGrupo(docId, opts = {}) {
         }
         return;
     }
-    const { activo, grupoJid } = await leerConfigNotificacionGrupoAgendaEntregas();
+    let { activo, grupoJid, rawGrupoConfig } = await leerConfigNotificacionGrupoAgendaEntregas();
+    if (activo && !grupoJid && rawGrupoConfig) {
+        grupoJid = await resolverJidGrupoAgendaOperativo(rawGrupoConfig, vickySocketRef.current);
+    }
     vickyRuntimeCfg.GRUPO_JID_AGENDA_ENTREGAS = grupoJid;
     vickyRuntimeCfg.NOTIFICAR_AGENDA_GRUPO_ACTIVO = activo;
     if (!activo || !grupoJid) {
@@ -970,7 +1016,7 @@ async function intentarNotificarNuevaEntregaAgendaGrupo(docId, opts = {}) {
             `[agenda-grupo] doc=${docId}: sin aviso al grupo — ` +
                 (!activo
                     ? 'desactivaste “Avisos activos” en panel → General.'
-                    : 'falta JID …@g.us (General → Guardar) o WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS en Cloud Run.')
+                    : 'falta JID …@g.us, enlace https://chat.whatsapp.com/… o código de invitación (General → Guardar / env).')
         );
         return;
     }
@@ -1006,7 +1052,10 @@ async function intentarNotificarNuevaEntregaAgendaGrupo(docId, opts = {}) {
 
 async function procesarPendientesNotificacionAgendaGrupo() {
     if (!firestoreModule.isAvailable() || !vickySocketRef.current) return;
-    const { activo, grupoJid } = await leerConfigNotificacionGrupoAgendaEntregas();
+    let { activo, grupoJid, rawGrupoConfig } = await leerConfigNotificacionGrupoAgendaEntregas();
+    if (activo && !grupoJid && rawGrupoConfig) {
+        grupoJid = await resolverJidGrupoAgendaOperativo(rawGrupoConfig, vickySocketRef.current);
+    }
     const ids = await firestoreModule.listEntregaAgendaIdsPendientesNotificarGrupo(12);
     if (!ids.length) return;
     if (!activo || !grupoJid) {
@@ -1015,7 +1064,7 @@ async function procesarPendientesNotificacionAgendaGrupo() {
             lastAgendaGrupoSkipLogMs = now;
             const msg = !activo
                 ? 'Hay entregas sin aviso al grupo: en panel → General desactivaste “Avisos activos” (agenda).'
-                : 'Hay entregas sin aviso al grupo: falta JID válido …@g.us (panel General → Guardar) o variable WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS.';
+                : 'Hay entregas sin aviso al grupo: falta JID …@g.us, enlace chat.whatsapp.com o código invitación (General → Guardar / env).';
             console.warn(`⚠️ [agenda-grupo] ${msg} (${ids.length} pendiente(s)).`);
         }
         return;
@@ -3807,12 +3856,17 @@ async function connectToWhatsApp(isReconnect = false) {
         );
         vickyRuntimeCfg.GRUPO_JID_AGENDA_ENTREGAS = gjAgenda;
         vickyRuntimeCfg.NOTIFICAR_AGENDA_GRUPO_ACTIVO = configGeneral.notificarAgendaEntregasGrupoActivo !== false;
-        if (String(configGeneral.whatsappGrupoJidAgendaEntregas || '').trim() || process.env.WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS) {
+        const rawAgG = String(configGeneral.whatsappGrupoJidAgendaEntregas || process.env.WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS || '').trim();
+        if (rawAgG) {
             if (gjAgenda) {
                 console.log(`📣 Agenda entregas: avisos al grupo WA (${gjAgenda.slice(0, 36)}…)`);
+            } else if (extraerCodigoInvitacionGrupoWhatsapp(rawAgG)) {
+                console.log(
+                    '📣 Agenda entregas: configurado enlace/código de invitación; el JID …@g.us se resuelve al primer aviso (WhatsApp conectado).'
+                );
             } else {
                 console.warn(
-                    '⚠️ whatsappGrupoJidAgendaEntregas / WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS debe ser JID completo terminado en @g.us (ej. 120363…@g.us).'
+                    '⚠️ whatsappGrupoJidAgendaEntregas: usá JID …@g.us, enlace https://chat.whatsapp.com/… o código de invitación del grupo.'
                 );
             }
         }

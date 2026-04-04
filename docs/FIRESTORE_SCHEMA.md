@@ -15,7 +15,7 @@ Fuente de verdad para alinear bot, dashboard y archivos en [`firebase/`](../fire
 
 **Subcolección** `config/prompts/borradores/{borradorId}` — uso **histórico / panel**: el flujo actual de WhatsApp `#g` + *OK* **fusiona directo** en `config/prompts.sistemaPrompt` (sin pasar por esta subcolección). El panel puede seguir listando borradores viejos o crearlos por otras vías si aplica.
 
-**JID de un grupo WhatsApp (`…@g.us`):** en el teléfono no se muestra el ID interno. Con la misma sesión Baileys que el bot (carpeta `auth_info_baileys`), en la PC del repo: `npm run wa:grupo-jid -- --list` (grupos donde está la cuenta) o `npm run wa:grupo-jid -- --invite CODIGO` siendo `CODIGO` la parte final del enlace `https://chat.whatsapp.com/…`. Parar `node bot.js` antes de ejecutar el script. Ver `scripts/whatsapp-grupo-jid.js`.
+**Grupo WhatsApp (avisos agenda):** en `config/general` o env podés guardar el **JID** (`…@g.us`), el **enlace** `https://chat.whatsapp.com/…` o el **código** del enlace; el bot resuelve enlace/código a JID con Baileys al enviar. En el teléfono no se muestra el JID. Con la sesión Baileys del bot (`auth_info_baileys`), en la PC: `npm run wa:grupo-jid -- --list` o `npm run wa:grupo-jid -- --invite CODIGO`. Parar `node bot.js` antes del script. Ver `scripts/whatsapp-grupo-jid.js`.
 
 ### `servicios/{servicioId}`
 
