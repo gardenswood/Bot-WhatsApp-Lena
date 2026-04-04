@@ -7,13 +7,20 @@
     "start": "node bot.js",
     "deploy": "node scripts/deploy.js",
     "deploy:watch": "node scripts/deploy.js --watch",
-    "deploy:dry": "node scripts/deploy.js --dry-run"
+    "deploy:dry": "node scripts/deploy.js --dry-run",
+    "docs:pdf": "node scripts/generate-knowledge-pdfs.js",
+    "verify": "node scripts/verify-flow.js",
+    "labels:discover": "node scripts/discover-wa-labels.js",
+    "geocode:clientes": "node scripts/geocodificar-clientes-direccion.js",
+    "verify:cliente-agenda": "node scripts/verificar-cliente-agenda.js",
+    "seed:lid-mapeo": "node scripts/seed-lid-mapeo.js"
   },
   "dependencies": {
     "@adiwajshing/keyed-db": "^0.2.4",
     "@google-cloud/storage": "^7.19.0",
     "@google/generative-ai": "^0.24.1",
     "@sparticuz/chromium": "^143.0.4",
+    "@turf/turf": "^7.3.4",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "firebase-admin": "^13.7.0",
     "libsignal-node": "^2.0.1",

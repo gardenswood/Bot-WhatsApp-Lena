@@ -1,0 +1,110 @@
+---
+description: Reglas de comportamiento del bot Vicky - WhatsApp Gardens Wood
+globs: bot.js
+alwaysApply: true
+---
+
+# Bot Vicky - Reglas de Comportamiento
+
+## Audio de bienvenida (WhatsApp)
+- Al primer contacto de un cliente nuevo, Vicky envía un audio de bienvenida (`ElevenLabs_2026-03-21T11_41_40_Melisa_pvc_sp110_s91_sb75_se0_b_m2.mp3`, referenciado en `AUDIO_INTRO_PATH`).
+- Inmediatamente después del audio, envía el texto de bienvenida (default: `¿En qué te puedo ayudar? Escribime porfa que me es más fácil responder 😊`), configurable en Firestore `config/prompts` → `mensajeBienvenidaTexto`.
+- **El audio y el texto se envían UNA SOLA VEZ por cliente, para siempre.**
+- El flag `audioIntroEnviado: true` se guarda en `clientesHistorial` (GCS) para no repetirlo.
+- **TTS ElevenLabs (notas de voz):** en `bot.js` → `normalizarTextoParaAudio`, la letra **x** solo se sustituye por la palabra «por» cuando hay **número × número** (multiplicación). No se toca la **x** dentro de palabras (`excelente`, `exterior`, `próximo`, etc.).
+
+## Ubicación CRM (mapa / geocode)
+- Marcadores internos (Gemini): `[DIRECCION:…]`, `[ZONA:…]`, `[BARRIO:…]`, `[LOCALIDAD:…]`, `[REFERENCIA:…]`, `[NOTAS_UBICACION:…]` → Firestore `clientes/*` + sync; el cron `/internal/cron/geocode-clientes` y `npm run geocode:clientes` arman Nominatim con esos campos. Panel **Cliente** los edita.
+- El bot **anexa siempre** al system prompt (después de Firestore + bloque servicios) el texto `SYSTEM_PROMPT_SUFIJO_UBICACION_MARCADORES` en `bot.js`, así no hace falta duplicar esas reglas en el panel.
+
+## Instagram DM (Meta)
+- **Webhook:** `GET`/`POST` en el mismo HTTP del bot: `/webhooks/instagram` (sin Bearer cron; verificación Meta + firma `X-Hub-Signature-256`). Módulo `instagram-dm.js`.
+- **Env:** `INSTAGRAM_WEBHOOK_VERIFY_TOKEN`, `META_APP_SECRET`, `INSTAGRAM_PAGE_ACCESS_TOKEN` (alias `FACEBOOK_PAGE_ACCESS_TOKEN`). Detalle y URL de callback: `RUNBOOK_DEPLOY.md` §2d.
+- **Identidad:** hilo `ig:{instagramScopedUserId}` en `SESSIONS`, Firestore `chats/ig:…`, `clientes/ig:…`; historial consultas en GCS/local como `historial_consultas/ig_{id}.json` (sin `:` en nombre de archivo).
+- **Panel:** `config/general` → `instagramDmActivo` apaga solo respuestas Instagram; `botActivo` sigue gobernando todo.
+- **v1:** sin audio intro ni adjuntos binarios por IG (solo texto de bienvenida + respuestas Gemini en texto; catálogo `[IMG:…]` se sustituye por mensaje que deriva a WhatsApp).
+
+## Flujo después del audio
+- Cuando el cliente responde, Vicky continúa con el flujo normal según el servicio que mencione:
+  leña → catálogo de leña | cerco → catálogo de cercos | pérgola → catálogo de pérgolas | fogonero → catálogo fogonero
+
+## Servicios activos
+- Leña, Cercos, Pérgolas, Sector Fogonero, Bancos — IDs Firestore: `lena`, `cerco`, `pergola`, `fogonero`, `bancos` (panel **Precios y servicios**).
+- **Precios y textos de envío:** fuente operativa = Firestore `servicios/*`; el bot anexa el bloque `[DATOS_SERVICIOS_FIRESTORE]` al system prompt al arrancar. Tras editar precios en el panel → **redeploy** `vicky-bot`. El prompt fallback en `bot.js` queda como respaldo si Firestore falla.
+- Info de envío (`infoEnvio`) en documentos con `tieneEnvio: true` (típicamente leña).
+- **Instagram (@gardens.wood):** mismas reglas y precios que WhatsApp; reutilizá el mismo `sistemaPrompt` y `servicios/*` de Firestore.
+- Esquema y despliegue de reglas/índices: `docs/FIRESTORE_SCHEMA.md`, carpeta `firebase/`.
+
+## Reglas generales
+- Modo admin WhatsApp: solo si el mensaje **empieza** con `ADMIN_SECRET` (env; default `!vicky`). Si la frase va **sola** (sin texto después), el bot muestra **menú numerado** (1 envío a cliente / 2 instructivo `#g` / 3 agenda entregas asistente / 4 atajos `#`); escribir un comando con *#* sale del menú al flujo habitual. Salida: mensaje exacto `ADMIN_EXIT_COMMAND` (env; default `adminoff`) o `#salir` / `#SALIR` — además **reactiva Vicky** en ese chat (quita silencio humano/Firestore y ecos `fromMe` del bot no cuentan como humano en ventana corta). `ADMIN_PHONE` es para **envíos** al dueño (ruta leña, reportes, venta, clima, etc.), no activa admin por JID. La sesión admin se persiste en Firestore (`adminWaSesion`) para varias réplicas de Cloud Run; la vista previa de `#g` **no** se replica. Con *OK* en WhatsApp se **anexa** el instructivo a `config/prompts.sistemaPrompt` y se recarga Gemini en ese proceso; otras réplicas Cloud Run se alinean con redeploy o al reiniciarse.
+- Con sesión admin: instructivo Gemini = **`#g`** o **`!!g`** o **`vicky:g`** (texto/audio → vista previa → *OK* → se anexa a `sistemaPrompt` en Firestore y recarga Gemini en el proceso). **`#reporte`** guarda índice en sesión; después **`detalle caliente`** / **`detalle estado NOMBRE`** / **`detalle servicio X`** / **`detalle log`** o **`#d …`** listan contactos o el log. **Aviso masivo:** **`#enviar clientes …texto…`** (todos con `remoteJid` en Firestore; tope y delay como `#ruta`) o **`#enviar leña`** / **`cerco`** / **`pergola`** / **`fogonero`** + mensaje; **`!!enviar`**; por audio, marcadores **`CAMPANA_TODOS`** / **`CAMPANA_LENA`**, etc. **Campaña por zona:** **`#ruta ZONA PRODUCTO`** (filtro texto `zona` en CRM). **Campaña por corredor geográfico:** **`#ruta_geo ID_DOC_RUTA PRODUCTO`** (polilínea + buffer en Firestore `rutas_logistica`, panel **Logística — ruta / campaña geo**; clientes con `lat`/`lng`). **Silencio:** **`#silencio global`** / **`#silencio todos`** → `config/general.botActivo=false`; **`#activo global`** / **`#vicky activa`** → bot otra vez para todos; **`#silenciar`** + criterio (como puente) → solo ese chat (`humanoAtendiendo`); **`#activar`** + criterio → reactivar ese chat. Puente cliente = **`#c`** / **`!!c`** / **`vicky:c`**. **Agenda de entregas desde admin** (misma colección que `[ENTREGA:…]`): **`#entrega YYYY-MM-DD HH:mm|-- título`** con **`#c`**, o JID + título, o **`#entrega`** + **solo tel** (10–15 dígitos) para que **Gemini** infiera fecha desde hilo Firestore + CRM; **`#entrega lista`** (próximos desde hoy, AR) y **`#entrega lista todas`** (incluye canceladas); **`!!entrega`** si `#` falla. **`#g`** no sirve para la agenda (solo instructivo Gemini). Reporte / ruta / salir: **`#…`**, **`!!…`** o **`vicky:…`**. WhatsApp a veces altera `#`; usar `!!` evita eso. `#c` solo en dos pasos o `#c Juan` en uno. Marcadores `[CRM:…]`, `[NOTIFICAR_VENTA:…]`, `[AGENDAR:…]`. Antes de cada respuesta cliente, el bot inyecta **`[HILO_WHATSAPP_RECIENTE]`** desde `chats/{jid}/mensajes` (Firestore) + **`[LECTURA_OBLIGATORIA]`** + historial Gemini. Cron: `POST /internal/cron/programados`, `/internal/cron/weather` y **`/internal/cron/geocode-clientes`** (Nominatim → `clientes.lat`/`lng`; activar/desactivar y tope en panel **General** → `geocodeCronActivo`, `geocodeCronMaxPorEjecucion`) con `Authorization: Bearer VICKY_CRON_SECRET` (ver `RUNBOOK_DEPLOY.md`).
+- No responder en grupos (`remoteJid.endsWith('@g.us')` → return)
+- Si un humano responde desde el teléfono, el bot se silencia en ese chat por 24 horas
+- No re-saludar si el cliente habló hace menos de 6 horas
+- Delay antes de responder (simula escritura humana): **mínimo ~26 s** (prom ~30 s) aunque el panel tenga valores más bajos; por defecto en Firestore 26–34 s; configurable en `config/general` (`delayMinSeg`, `delayMaxSeg`)
+- **Etiqueta WA Business “contactar asesor”:** si en `config/general` está `whatsappLabelIdContactarAsesor` (o env `WHATSAPP_LABEL_ID_CONTACTAR_ASESOR`), al traspaso con `[HANDOFF_EXPERTO:…]` el bot aplica esa etiqueta al chat (`addChatLabel`). Cuenta Business; descubrir id con `VICKY_LOG_LABELS=1` en consola.
+- **Retorno tras silencio (≥ ~6 h):** Vicky puede saludar con **primer nombre** si está en CRM (`nombre` o `pushName`) y se le pide releer `[CONTEXTO_HISTORIAL_CONSULTAS]` + `[LECTURA_CHAT_PREVIO]`. Tras redeploy, `ultimoMensaje` en historial GCS alimenta el cálculo de silencio (no arranca en cero la sesión).
+
+## Persistencia
+- Historial en GCS: `gs://webgardens-8655d_whatsapp_session/usuarios_vistos.json`
+- Historial de consultas por cliente (texto + nombre, últimos intercambios): carpeta local `historial_consultas/` y en GCS `historial_consultas/{clave}.json` (`{tel}` WhatsApp o `ig_{id}` para thread `ig:{id}`) — Vicky lo carga al abrir sesión y lo actualiza tras cada respuesta.
+- Sesión WhatsApp en GCS: `gs://webgardens-8655d_whatsapp_session/auth/`
+- Vinculación local por código: `WHATSAPP_PAIRING_PHONE` = mismo número que el perfil de WhatsApp (AR móvil típico `549…`). Si el teléfono rechaza el enlace: `WHATSAPP_PAIRING_SKIP_GCS_AUTH=1` hasta vincular (sesión limpia sin bajar `auth/` de GCS); detalle en `RUNBOOK_DEPLOY.md`.
+- Deploy bot: Google Cloud Run proyecto `webgardens-8655d`, región `us-central1`, servicio `vicky-bot`
+
+## Dashboard de administración
+- Proyecto Next.js 15 en `dashboard/` (carpeta hermana de `Bot_WhatsApp_Lena/`)
+- Firebase Auth + Firestore como capa de datos compartida
+- Firestore loguea cada mensaje en `chats/{jid}/mensajes/` vía `firestore-module.js`
+- Clientes se sincronizan a `clientes/{tel}` en Firestore
+- Config dinámica: el bot lee `config/general`, `config/prompts` y `servicios/*` de Firestore al arrancar (precios inyectados al prompt). Ficha **Cliente**: CRM (`potencial`, `statusCrm`, `urgencia`, `interes`, `zona`) editable; alineado con `docs/FIRESTORE_SCHEMA.md`.
+- Deploy dashboard: Cloud Run servicio `vicky-dashboard`
+- Dev local: `npm run dev` en `dashboard/` → `http://localhost:3000`
+- Crear primer admin: `npm run crear-admin` en `dashboard/`
+
+## Llamadas telefónicas (ElevenLabs Conversational AI + Twilio)
+
+Seguimiento automático a las 24 h: además del audio/texto de WhatsApp, el bot puede iniciar una llamada saliente al cliente si tiene `telefono` en historial (ver `llamarClienteElevenLabs` y timer de seguimiento en `bot.js`).
+
+### Identificadores (no pegar secretos en el repo)
+
+- Agente ElevenLabs: nombre `vicky`, ID `agent_6101kmm5scd6evw8xqbyespx4dfe`.
+- Número Twilio importado en ElevenLabs: `phone_number_id` `phnum_9501kmmbjr2cfyj8r9cbwnr9b7g3` (Caller ID verificado sin el 9 móvil: `+543515576639`).
+- En código: constantes `ELEVENLABS_AGENT_ID` y `ELEVENLABS_PHONE_NUMBER_ID` (fallback por defecto si no están en env).
+
+### Formato de números Argentina
+
+- Para **celulares**: usar `+549` + código de área + número (ej. `+5493512956376`). Sin el `9` la llamada puede fallar o no sonar bien.
+- No se puede llamar **desde y hacia el mismo número** (origen = destino): Twilio no completa el bucle; probar con otro celular o cuenta fuera de trial.
+
+### Voz alineada con WhatsApp
+
+- Misma voz que TTS de notas de voz: `voice_id` `4wDRKlxcHNOFO5kBvE81` (variable `ELEVENLABS_VOICE_ID` en Cloud Run).
+- Modelo TTS recomendado para llamadas en tiempo real: `eleven_turbo_v2_5` (menor latencia). Otra `voice_id` puede sonar distinta (ej. voz masculina).
+- Idioma del agente: **español** (`es`). Si queda en inglés, el acento suena trabado.
+
+### Cuentas y permisos
+
+- API key ElevenLabs: debe incluir permiso **convai_write** para registrar números y API de llamadas; una key solo de TTS no alcanza.
+- Twilio: fuera de **trial** para llamar a números no verificados (cargar saldo).
+
+### Variables Cloud Run (buena práctica)
+
+Definir explícitamente (además de `ELEVENLABS_API_KEY` y `ELEVENLABS_VOICE_ID`):
+
+- `ELEVENLABS_AGENT_ID` — debe coincidir con el agente en el panel ElevenLabs.
+- `ELEVENLABS_PHONE_NUMBER_ID` — debe coincidir con el número importado en ConvAI.
+
+### Voz más natural y pausas
+
+Ajustes en el panel ElevenLabs (agente) o vía PATCH a `conversation_config`:
+
+| Palanca | Efecto típico |
+|--------|----------------|
+| `stability` ~0.35–0.45 | Más variación, menos monótono |
+| `similarity_boost` ~0.72–0.78 | Alineación con la voz |
+| `optimize_streaming_latency` | Equilibrio latencia vs fluidez |
+| Prompt del sistema | Frases cortas, una idea por frase, comas naturales; evitar párrafos largos de una sola exhalación |
+| `speed` (si está disponible en la API del agente) | Ligeramente menor a 1.0 si habla muy rápido |
+
+Las pausas en voz conversacional dependen del **turn-taking** y de cómo el LLM parte las respuestas; no son iguales al TTS de texto estático. Si suena robótico, priorizar prompt corto y tono rioplatense; revisar `turn_timeout` en la config del agente según documentación vigente de ElevenLabs.

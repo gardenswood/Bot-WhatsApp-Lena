@@ -3,6 +3,7 @@ auth_info_baileys/
 .wwebjs_auth/
 .wwebjs_cache/
 usuarios_vistos.json
+historial_consultas/
 cola_lena.json
 qr.png
 *.log

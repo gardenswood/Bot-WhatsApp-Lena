@@ -5,6 +5,7 @@ on:
     branches: [master, main]
     paths:
       - 'bot.js'
+      - 'vicky-gemini-turn.js'
       - 'firestore-module.js'
       - 'package.json'
       - 'Dockerfile'
