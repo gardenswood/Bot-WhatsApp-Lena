@@ -815,6 +815,8 @@ let waReconnectTimer = null;
 const vickySocketRef = { current: null };
 /** Sondeo de `entregas_agenda` pendientes de aviso al grupo WA (altas desde panel). */
 let agendaGrupoNotifyInterval = null;
+/** Evita spam en consola si falta JID o está apagado el toggle pero hay pendientes. */
+let lastAgendaGrupoSkipLogMs = 0;
 /** Firestore + Gemini + delays: solo la primera vez; reconexiones solo recrean el socket. */
 let vickyBootstrapHecho = false;
 let vickyGeminiModel = null;
@@ -896,10 +898,20 @@ async function sendBotMessage(jid, content) {
 }
 
 function normalizarJidGrupoAgendaEntregas(raw) {
-    const s = String(raw || '').trim().replace(/\s/g, '');
+    let s = String(raw ?? '')
+        .trim()
+        .replace(/^\uFEFF/, '')
+        .replace(/[\u200B-\u200D\uFEFF]/g, '');
+    s = s.replace(/^['"`]+|['"`]+$/g, '');
+    s = s.replace(/\s/g, '');
     if (!s) return '';
-    if (s.endsWith('@g.us')) return s;
-    return '';
+    const lower = s.toLowerCase();
+    const suf = '@g.us';
+    if (!lower.endsWith(suf)) return '';
+    const i = lower.lastIndexOf(suf);
+    const localPart = s.slice(0, i);
+    if (!localPart) return '';
+    return `${localPart}@g.us`;
 }
 
 function textoNotificacionEntregaAgendaEnGrupo(docId, d) {
@@ -923,7 +935,8 @@ async function leerConfigNotificacionGrupoAgendaEntregas() {
         const jid = normalizarJidGrupoAgendaEntregas(process.env.WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS);
         return { activo: true, grupoJid: jid };
     }
-    const cfg = await firestoreModule.getConfigGeneral();
+    // Sin caché: el JID del grupo suele guardarse después del arranque; el cache 5 min de getConfigGeneral dejaba grupoJid vacío.
+    const cfg = await firestoreModule.getConfigGeneral({ bypassCache: true });
     const jid = normalizarJidGrupoAgendaEntregas(
         cfg.whatsappGrupoJidAgendaEntregas || process.env.WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS
     );
@@ -952,6 +965,9 @@ async function intentarNotificarNuevaEntregaAgendaGrupo(docId) {
         console.warn(
             `⚠️ No se pudo enviar notificación de agenda al grupo (${String(grupoJid).slice(0, 32)}…); doc ${docId} queda pendiente.`
         );
+        console.warn(
+            '   [agenda-grupo] Revisá: la cuenta del bot es miembro del grupo, JID correcto (@g.us), WhatsApp conectado; mirá el warning previo de sendBotMessage.'
+        );
     } else {
         console.log(`📣 Agenda entregas → grupo WA (${docId})`);
     }
@@ -960,8 +976,19 @@ async function intentarNotificarNuevaEntregaAgendaGrupo(docId) {
 async function procesarPendientesNotificacionAgendaGrupo() {
     if (!firestoreModule.isAvailable() || !vickySocketRef.current) return;
     const { activo, grupoJid } = await leerConfigNotificacionGrupoAgendaEntregas();
-    if (!activo || !grupoJid) return;
     const ids = await firestoreModule.listEntregaAgendaIdsPendientesNotificarGrupo(12);
+    if (!ids.length) return;
+    if (!activo || !grupoJid) {
+        const now = Date.now();
+        if (now - lastAgendaGrupoSkipLogMs > 120000) {
+            lastAgendaGrupoSkipLogMs = now;
+            const msg = !activo
+                ? 'Hay entregas sin aviso al grupo: en panel → General desactivaste “Avisos activos” (agenda).'
+                : 'Hay entregas sin aviso al grupo: falta JID válido …@g.us (panel General → Guardar) o variable WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS.';
+            console.warn(`⚠️ [agenda-grupo] ${msg} (${ids.length} pendiente(s)).`);
+        }
+        return;
+    }
     for (const id of ids) {
         await intentarNotificarNuevaEntregaAgendaGrupo(id);
     }
@@ -3750,7 +3777,7 @@ async function connectToWhatsApp(isReconnect = false) {
         vickyRuntimeCfg.GRUPO_JID_AGENDA_ENTREGAS = gjAgenda;
         vickyRuntimeCfg.NOTIFICAR_AGENDA_GRUPO_ACTIVO = configGeneral.notificarAgendaEntregasGrupoActivo !== false;
         if (String(configGeneral.whatsappGrupoJidAgendaEntregas || '').trim() || process.env.WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS) {
-            if (gjAgenda.endsWith('@g.us')) {
+            if (gjAgenda) {
                 console.log(`📣 Agenda entregas: avisos al grupo WA (${gjAgenda.slice(0, 36)}…)`);
             } else {
                 console.warn(

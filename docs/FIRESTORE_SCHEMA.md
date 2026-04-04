@@ -8,12 +8,14 @@ Fuente de verdad para alinear bot, dashboard y archivos en [`firebase/`](../fire
 
 | Documento | Campos principales | Escritura | Lectura bot |
 |-----------|-------------------|-----------|-------------|
-| `general` | `delayMinSeg`, `delayMaxSeg`, `modeloGemini`, `frecuenciaAudioFidelizacion`, `tiempoSilencioHumanoHoras`, `botActivo`, **`instagramDmActivo`**, `adminPhone`, **`datosEntregaNotifyPhone`**, horarios atención, `whatsappLabelIdContactarAsesor`, campañas (`campanaDelayMinSeg`, `campanaDelayMaxSeg`, `campanaMaxDestinatarios`, `campanaDescuentoPct`, `campanaRutaFechaTexto`, `campanaRutaPlantilla`), **`geocodeCronActivo`**, **`geocodeCronMaxPorEjecucion`**, **`whatsappGrupoJidAgendaEntregas`** (JID `…@g.us` — aviso al grupo al crear `entregas_agenda`), **`notificarAgendaEntregasGrupoActivo`** (default true) | Panel → General | Cache ~5 min; avisos agenda usan hook + sondeo ~50 s (altas panel/bot) |
+| `general` | `delayMinSeg`, `delayMaxSeg`, `modeloGemini`, `frecuenciaAudioFidelizacion`, `tiempoSilencioHumanoHoras`, `botActivo`, **`instagramDmActivo`**, `adminPhone`, **`datosEntregaNotifyPhone`**, horarios atención, `whatsappLabelIdContactarAsesor`, campañas (`campanaDelayMinSeg`, `campanaDelayMaxSeg`, `campanaMaxDestinatarios`, `campanaDescuentoPct`, `campanaRutaFechaTexto`, `campanaRutaPlantilla`), **`geocodeCronActivo`**, **`geocodeCronMaxPorEjecucion`**, **`whatsappGrupoJidAgendaEntregas`** (JID `…@g.us` — aviso al grupo al crear `entregas_agenda`), **`notificarAgendaEntregasGrupoActivo`** (default true) | Panel → General | Cache ~5 min en la mayoría de campos; **`whatsappGrupoJidAgendaEntregas`** / toggle agenda se leen **sin caché** en cada aviso al grupo (evita JID vacío tras guardar en panel). Hook + sondeo ~50 s |
 | `prompts` | `sistemaPrompt`, `mensajeBienvenidaTexto` | Panel → Instrucciones AI | Al arranque |
 
 **Subcolección** `config/prompts/versiones/{id}` — historial de versiones del prompt (panel).
 
 **Subcolección** `config/prompts/borradores/{borradorId}` — uso **histórico / panel**: el flujo actual de WhatsApp `#g` + *OK* **fusiona directo** en `config/prompts.sistemaPrompt` (sin pasar por esta subcolección). El panel puede seguir listando borradores viejos o crearlos por otras vías si aplica.
+
+**JID de un grupo WhatsApp (`…@g.us`):** en el teléfono no se muestra el ID interno. Con la misma sesión Baileys que el bot (carpeta `auth_info_baileys`), en la PC del repo: `npm run wa:grupo-jid -- --list` (grupos donde está la cuenta) o `npm run wa:grupo-jid -- --invite CODIGO` siendo `CODIGO` la parte final del enlace `https://chat.whatsapp.com/…`. Parar `node bot.js` antes de ejecutar el script. Ver `scripts/whatsapp-grupo-jid.js`.
 
 ### `servicios/{servicioId}`
 
