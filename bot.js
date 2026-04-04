@@ -892,7 +892,8 @@ async function sendBotMessage(jid, content) {
         if (sent?.key?.id) BOT_MSG_IDS.add(sent.key.id);
         return sent;
     } catch (e) {
-        console.warn('⚠️ sendBotMessage:', e.message);
+        const extra = String(jid || '').endsWith('@g.us') ? ` (grupo ${String(jid).slice(0, 28)}…)` : '';
+        console.warn(`⚠️ sendBotMessage${extra}:`, e.message);
         return null;
     }
 }
@@ -907,8 +908,14 @@ function normalizarJidGrupoAgendaEntregas(raw) {
     if (!s) return '';
     const lower = s.toLowerCase();
     const suf = '@g.us';
-    if (!lower.endsWith(suf)) return '';
-    const i = lower.lastIndexOf(suf);
+    if (!lower.endsWith(suf)) {
+        // Texto extra al pegar (ej. "JID: 120363…@g.us" o varias líneas)
+        const m = s.match(/(\d{10,25}@g\.us)/i);
+        if (m) s = m[1];
+    }
+    const lower2 = s.toLowerCase();
+    if (!lower2.endsWith(suf)) return '';
+    const i = lower2.lastIndexOf(suf);
     const localPart = s.slice(0, i);
     if (!localPart) return '';
     return `${localPart}@g.us`;
@@ -944,13 +951,29 @@ async function leerConfigNotificacionGrupoAgendaEntregas() {
     return { activo, grupoJid: jid };
 }
 
-async function intentarNotificarNuevaEntregaAgendaGrupo(docId) {
+async function intentarNotificarNuevaEntregaAgendaGrupo(docId, opts = {}) {
+    const quietSock = opts.quietSocketLog === true;
     if (!docId || !firestoreModule.isAvailable()) return;
-    if (!vickySocketRef.current) return;
+    if (!vickySocketRef.current) {
+        if (!quietSock) {
+            console.warn(
+                `[agenda-grupo] doc=${docId}: sin socket WhatsApp (reconexión o arranque); se reintenta por sondeo (~50 s).`
+            );
+        }
+        return;
+    }
     const { activo, grupoJid } = await leerConfigNotificacionGrupoAgendaEntregas();
     vickyRuntimeCfg.GRUPO_JID_AGENDA_ENTREGAS = grupoJid;
     vickyRuntimeCfg.NOTIFICAR_AGENDA_GRUPO_ACTIVO = activo;
-    if (!activo || !grupoJid) return;
+    if (!activo || !grupoJid) {
+        console.warn(
+            `[agenda-grupo] doc=${docId}: sin aviso al grupo — ` +
+                (!activo
+                    ? 'desactivaste “Avisos activos” en panel → General.'
+                    : 'falta JID …@g.us (General → Guardar) o WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS en Cloud Run.')
+        );
+        return;
+    }
     const claimed = await firestoreModule.claimEntregaAgendaNotificacionGrupo(docId);
     if (!claimed) return;
     const d = await firestoreModule.getEntregaAgendaDocData(docId);
@@ -959,6 +982,14 @@ async function intentarNotificarNuevaEntregaAgendaGrupo(docId) {
         return;
     }
     const text = textoNotificacionEntregaAgendaEnGrupo(docId, d);
+    const sock = vickySocketRef.current;
+    if (sock && typeof sock.groupMetadata === 'function') {
+        try {
+            await sock.groupMetadata(grupoJid);
+        } catch (e) {
+            console.warn('[agenda-grupo] groupMetadata:', e?.message || e);
+        }
+    }
     const sent = await sendBotMessage(grupoJid, { text });
     if (!sent) {
         await firestoreModule.revertEntregaAgendaNotificacionGrupo(docId);
@@ -990,7 +1021,7 @@ async function procesarPendientesNotificacionAgendaGrupo() {
         return;
     }
     for (const id of ids) {
-        await intentarNotificarNuevaEntregaAgendaGrupo(id);
+        await intentarNotificarNuevaEntregaAgendaGrupo(id, { quietSocketLog: true });
     }
 }
 
