@@ -611,6 +611,32 @@ async function getMensajeBienvenidaTexto(fallback) {
     return fallback;
 }
 
+/** WhatsApp al cliente cuando admin dispara #final_entrega (panel → config/prompts). */
+async function getMensajeClienteCierreEntregaHumano(fallback) {
+    if (!firestoreDb) return fallback;
+    try {
+        const snap = await firestoreDb.collection('config').doc('prompts').get();
+        const t = snap.exists ? snap.data()?.mensajeClienteCierreEntregaHumano : null;
+        if (t && String(t).trim()) return String(t).trim();
+    } catch (e) {
+        console.warn('⚠️ Error leyendo mensajeClienteCierreEntregaHumano:', e.message);
+    }
+    return fallback;
+}
+
+/** Instrucción extra a Gemini mientras cierreEntregaAsistido (panel → config/prompts). */
+async function getInstruccionCierreEntregaHumanoGemini(fallback) {
+    if (!firestoreDb) return fallback;
+    try {
+        const snap = await firestoreDb.collection('config').doc('prompts').get();
+        const t = snap.exists ? snap.data()?.instruccionCierreEntregaHumanoGemini : null;
+        if (t && String(t).trim()) return String(t).trim();
+    } catch (e) {
+        console.warn('⚠️ Error leyendo instruccionCierreEntregaHumanoGemini:', e.message);
+    }
+    return fallback;
+}
+
 /**
  * Lee los precios de servicios desde Firestore.
  * Retorna null si no hay datos (el bot usa el prompt hardcodeado).
@@ -696,6 +722,44 @@ async function reactivarBotEnChat(jid) {
         chatSilenceCache.delete(jid);
     } catch (e) {
         console.warn('⚠️ Error reactivarBotEnChat:', e.message);
+    }
+}
+
+/** Solo quita `humanoAtendiendo` (no toca `silenciadoHasta` del panel). Para #final_entrega post-handoff. */
+async function quitarHumanoAtendiendoChat(jid) {
+    if (!firestoreDb || !jid) return;
+    try {
+        const admin = require('firebase-admin');
+        const FieldValue = admin.firestore.FieldValue;
+        await firestoreDb.collection('chats').doc(jid).set(
+            {
+                humanoAtendiendo: false,
+                humanoAtendiendoAt: FieldValue.delete(),
+            },
+            { merge: true }
+        );
+        chatSilenceCache.delete(jid);
+    } catch (e) {
+        console.warn('⚠️ Error quitarHumanoAtendiendoChat:', e.message);
+    }
+}
+
+async function setCierreEntregaAsistido(jid, value) {
+    if (!firestoreDb || !jid) return;
+    try {
+        const admin = require('firebase-admin');
+        const FieldValue = admin.firestore.FieldValue;
+        const on = value === true;
+        await firestoreDb.collection('chats').doc(jid).set(
+            {
+                cierreEntregaAsistido: on,
+                cierreEntregaAsistidoAt: on ? FieldValue.serverTimestamp() : FieldValue.delete(),
+            },
+            { merge: true }
+        );
+        chatSilenceCache.delete(jid);
+    } catch (e) {
+        console.warn('⚠️ Error setCierreEntregaAsistido:', e.message);
     }
 }
 
@@ -787,19 +851,25 @@ async function reactivarChatsParcialDesdeFirestore() {
  * Retorna { humanoAtendiendo, silenciadoHasta, shouldSilence }.
  */
 async function getChatSilenceState(jid) {
-    const fallback = { humanoAtendiendo: false, silenciadoHasta: null, shouldSilence: false };
+    const fallback = { humanoAtendiendo: false, silenciadoHasta: null, shouldSilence: false, cierreEntregaAsistido: false };
     if (!firestoreDb || !jid) return fallback;
 
     const now = Date.now();
     const cached = chatSilenceCache.get(jid);
     if (cached && (now - cached.fetchedAt) < chatSilenceTtlMs) {
-        return cached.value;
+        const v = cached.value || {};
+        return {
+            humanoAtendiendo: v.humanoAtendiendo === true,
+            silenciadoHasta: v.silenciadoHasta ?? null,
+            shouldSilence: v.shouldSilence === true,
+            cierreEntregaAsistido: v.cierreEntregaAsistido === true,
+        };
     }
 
     try {
         const snap = await firestoreDb.collection('chats').doc(jid).get();
         if (!snap.exists) {
-            const value = fallback;
+            const value = { ...fallback, cierreEntregaAsistido: false };
             chatSilenceCache.set(jid, { value, fetchedAt: now });
             return value;
         }
@@ -819,7 +889,8 @@ async function getChatSilenceState(jid) {
         }
 
         const shouldSilence = humanoAtendiendo || (silenciadoHastaMs ? (silenciadoHastaMs > now) : false);
-        const value = { humanoAtendiendo, silenciadoHasta: silenciadoHastaMs, shouldSilence };
+        const cierreEntregaAsistido = d.cierreEntregaAsistido === true;
+        const value = { humanoAtendiendo, silenciadoHasta: silenciadoHastaMs, shouldSilence, cierreEntregaAsistido };
         chatSilenceCache.set(jid, { value, fetchedAt: now });
         return value;
     } catch (e) {
@@ -1895,6 +1966,128 @@ async function getEntregaAgendaDocData(docId) {
     }
 }
 
+
+/** Ids candidatos `clientes/{id}` según dígitos de línea (misma lógica que agenda / resolver tel). */
+function variantesDocIdClienteDesdeDigitos(rawDigits) {
+    const d = String(rawDigits || '').replace(/\D/g, '');
+    const ids = [];
+    const push = (x) => {
+        if (x && !ids.includes(x)) ids.push(x);
+    };
+    if (d.length < 8) return ids;
+    push(d);
+    if (d.length === 10 && !d.startsWith('54')) push(`549${d}`);
+    if (d.length === 11 && d.startsWith('54') && !d.startsWith('549')) push(`549${d.slice(2)}`);
+    if (d.startsWith('549') && d.length > 3) push(d.slice(3));
+    return ids;
+}
+
+function soloDigitosTelFs(s) {
+    return String(s || '').replace(/\D/g, '');
+}
+
+/** Alineado con `telefonosMismoDueno` en bot.js (prefijos 54 / cola móvil AR). */
+function telefonosCoincidenFs(a, b) {
+    const da = soloDigitosTelFs(a);
+    const db = soloDigitosTelFs(b);
+    if (da.length < 8 || db.length < 8) return false;
+    if (da === db) return true;
+    const tailA = da.slice(-10);
+    const tailB = db.slice(-10);
+    if (tailA.length === 10 && tailB.length === 10 && tailA === tailB) return true;
+    return da.endsWith(db) || db.endsWith(da);
+}
+
+function docClienteCoincideConDigitos(data, docId, digitosObjetivo) {
+    const D = soloDigitosTelFs(digitosObjetivo);
+    if (D.length < 8) return false;
+    const rj = String(data?.remoteJid || '').trim();
+    // Si hay JID @s con usuario largo, solo aceptamos si coincide con D (no alcanza docId por cola de 10 dígitos).
+    if (rj.endsWith('@s.whatsapp.net')) {
+        const userJ = soloDigitosTelFs(rj.replace(/@s\.whatsapp\.net$/i, ''));
+        if (userJ.length >= 8) {
+            return telefonosCoincidenFs(D, userJ);
+        }
+    }
+    const parts = [docId, data?.telefono].filter(Boolean);
+    return parts.some((p) => telefonosCoincidenFs(D, p));
+}
+
+/**
+ * Entre varios `clientes/{id}` candidatos, devuelve el doc cuyo id / remoteJid / telefono
+ * coincide con `digitosObjetivo`. Evita tomar un doc “corto” que sea de otro cliente.
+ * @returns {{ docId: string, data: object }|null}
+ */
+async function encontrarClienteDocCoincidentePorIds(ids, digitosObjetivo) {
+    if (!firestoreDb || !ids?.length) return null;
+    const D = soloDigitosTelFs(digitosObjetivo);
+    if (D.length < 8) return null;
+    const candidatos = [];
+    try {
+        for (const id of ids) {
+            const snap = await firestoreDb.collection('clientes').doc(id).get();
+            if (snap.exists) candidatos.push({ docId: id, data: snap.data() || {} });
+        }
+    } catch (e) {
+        console.warn('⚠️ encontrarClienteDocCoincidentePorIds:', e.message);
+        return null;
+    }
+    const ok = candidatos.filter((c) => docClienteCoincideConDigitos(c.data, c.docId, D));
+    if (ok.length === 0) return null;
+    if (ok.length === 1) return ok[0];
+    const exactId = ok.find((c) => soloDigitosTelFs(c.docId) === D);
+    if (exactId) return exactId;
+    const porJid = ok.find((c) => {
+        const rj = String(c.data.remoteJid || '').trim();
+        if (!rj.endsWith('@s.whatsapp.net')) return false;
+        return soloDigitosTelFs(rj.replace(/@s\.whatsapp\.net$/i, '')) === D;
+    });
+    if (porJid) return porJid;
+    return ok[0];
+}
+
+/**
+ * Datos ligeros de `clientes/*` para armar aviso de agenda al grupo (tel / nombre) cuando el proceso no tiene memoria local.
+ * Chats `@lid`: los docs son `clientes/{tel}`, no `clientes/{lid}` — se resuelve por `lid_mapeo`, `whatsappLid` o `remoteJid`.
+ * @param {string} jid
+ * @returns {Promise<object|null>}
+ */
+async function getClienteDocDataParaAvisoAgenda(jid) {
+    if (!firestoreDb || !jid) return null;
+    const j = String(jid).trim();
+    if (j.startsWith('ig:')) return null;
+    try {
+        if (j.endsWith('@s.whatsapp.net')) {
+            const d = j.replace(/@s\.whatsapp\.net$/i, '').replace(/\D/g, '');
+            if (d.length < 8) return null;
+            const ids = variantesDocIdClienteDesdeDigitos(d);
+            const hit = await encontrarClienteDocCoincidentePorIds(ids, d);
+            return hit ? hit.data : null;
+        }
+        if (j.endsWith('@lid')) {
+            const lidDigits = j.replace(/@lid$/i, '').replace(/\D/g, '');
+            if (lidDigits.length < 5) return null;
+            const mapeo = await firestoreDb.collection('lid_mapeo').doc(lidDigits).get();
+            if (mapeo.exists) {
+                const tel = String(mapeo.data()?.telefono || '').replace(/\D/g, '');
+                if (tel.length >= 8) {
+                    const idsM = variantesDocIdClienteDesdeDigitos(tel);
+                    const hitM = await encontrarClienteDocCoincidentePorIds(idsM, tel);
+                    if (hitM) return hitM.data;
+                }
+            }
+            let q = await firestoreDb.collection('clientes').where('whatsappLid', '==', lidDigits).limit(1).get();
+            if (!q.empty) return q.docs[0].data() || {};
+            q = await firestoreDb.collection('clientes').where('remoteJid', '==', j).limit(1).get();
+            if (!q.empty) return q.docs[0].data() || {};
+            return null;
+        }
+    } catch (e) {
+        console.warn('⚠️ getClienteDocDataParaAvisoAgenda:', e.message);
+    }
+    return null;
+}
+
 /** IDs con notificadoGrupoAgenda == false (altas desde panel u omitidas por socket cerrado). */
 async function listEntregaAgendaIdsPendientesNotificarGrupo(limit = 12) {
     if (!firestoreDb) return [];
@@ -2228,31 +2421,33 @@ async function resolverJidClientePorVariantesTelefono(rawDigits) {
     if (!firestoreDb) return null;
     const d = String(rawDigits || '').replace(/\D/g, '');
     if (d.length < 8) return null;
-    const ids = [];
-    const push = (x) => {
-        if (x && !ids.includes(x)) ids.push(x);
-    };
-    push(d);
-    if (d.length === 10 && !d.startsWith('54')) push(`549${d}`);
-    if (d.length === 11 && d.startsWith('54') && !d.startsWith('549')) push(`549${d.slice(2)}`);
-    if (d.startsWith('549') && d.length > 3) push(d.slice(3));
+    const ids = variantesDocIdClienteDesdeDigitos(d);
     try {
-        for (const id of ids) {
-            const snap = await firestoreDb.collection('clientes').doc(id).get();
-            if (!snap.exists) continue;
-            const x = snap.data() || {};
-            const rj = String(x.remoteJid || '').trim();
-            const jid = rj || `${id}@s.whatsapp.net`;
-            return {
-                jid,
-                docId: id,
-                nombre: x.nombre ? String(x.nombre) : null,
-            };
-        }
+        const hit = await encontrarClienteDocCoincidentePorIds(ids, d);
+        if (!hit) return null;
+        const x = hit.data;
+        const rj = String(x.remoteJid || '').trim();
+        const jid = rj || `${hit.docId}@s.whatsapp.net`;
+        return {
+            jid,
+            docId: hit.docId,
+            nombre: x.nombre ? String(x.nombre) : null,
+        };
     } catch (e) {
         console.warn('⚠️ resolverJidClientePorVariantesTelefono:', e.message);
     }
     return null;
+}
+
+/**
+ * CRM `clientes/*` que coincide con estos dígitos (misma regla que agenda / #entrega).
+ * Útil cuando el JID resuelto y el teléfono tipeado deben alinear el nombre en el bloque copiable.
+ */
+async function getClienteDocDataCoincidenteSoloDigitos(rawDigits) {
+    const d = String(rawDigits || '').replace(/\D/g, '');
+    if (!firestoreDb || d.length < 8) return null;
+    const hit = await encontrarClienteDocCoincidentePorIds(variantesDocIdClienteDesdeDigitos(d), d);
+    return hit ? hit.data : null;
 }
 
 /** Lee `pedidosAnteriores` del doc `clientes/{tel}` (array vacío si no existe). */
@@ -2333,6 +2528,10 @@ module.exports = {
     buildServiciosPromptSuffix,
     setHumanoAtendiendo,
     reactivarBotEnChat,
+    quitarHumanoAtendiendoChat,
+    setCierreEntregaAsistido,
+    getMensajeClienteCierreEntregaHumano,
+    getInstruccionCierreEntregaHumanoGemini,
     reactivarTodosLosChatsDesdeFirestore,
     reactivarChatsParcialDesdeFirestore,
     getChatSilenceState,
@@ -2357,6 +2556,8 @@ module.exports = {
     claimEntregaAgendaNotificacionGrupo,
     revertEntregaAgendaNotificacionGrupo,
     getEntregaAgendaDocData,
+    getClienteDocDataParaAvisoAgenda,
+    getClienteDocDataCoincidenteSoloDigitos,
     listEntregaAgendaIdsPendientesNotificarGrupo,
     saveLidMapeo,
     loadLidMapeoIntoMap,

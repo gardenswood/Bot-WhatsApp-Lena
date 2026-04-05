@@ -55,6 +55,15 @@ const { ejecutarCronGeocodificacionClientes } = require('./cron-geocode-clientes
 const { ejecutarTurnoVickyGeminiCore } = require('./vicky-gemini-turn');
 const instagramDmMod = require('./instagram-dm');
 
+/** Si `config/prompts.mensajeClienteCierreEntregaHumano` está vacío (#final_entrega). */
+const DEFAULT_MSJ_CLIENTE_CIERRE_ENTREGA_HUMANO =
+    'Hola! Para coordinar la entrega con Gardens Wood, necesito que me confirmés por acá:\n'
+    + '• Día y franja horaria que te quede bien\n'
+    + '• Dirección completa (y referencias si hace falta)\n'
+    + '• Si el contacto en puerta es otro número, decime cuál\n'
+    + '• Producto y cantidad si no quedó claro\n\n'
+    + 'Así dejo todo cargado en agenda. ¡Gracias!';
+
 // --- SERVIDOR HTTP (salud + cron interno) ---
 const PORT = process.env.PORT || 8080;
 
@@ -938,6 +947,36 @@ let agendaGrupoInviteResolveCache = { key: '', jid: '' };
 /**
  * JID …@g.us operativo: normaliza o resuelve enlace/código con Baileys (`groupGetInviteInfo`).
  */
+/** Quita de las notas la parte “Cliente: …” si es un teléfono distinto al de Contacto guardado. */
+function notasEntregaAgendaParaAvisoGrupo(notas, telAviso) {
+    const raw = String(notas || '').trim();
+    if (!raw) return '';
+    const tel = String(telAviso || '').replace(/\D/g, '');
+    if (tel.length < 8) return raw.slice(0, 280);
+    const parts = raw.split(/\s*·\s*/).map((p) => p.trim()).filter(Boolean);
+    const kept = parts.filter((p) => {
+        const m = p.match(/^Cliente:\s*(.+)$/i);
+        if (!m) return true;
+        const inner = m[1].trim();
+        if (!textoPareceSoloTelefono(inner)) return true;
+        return telefonosMismoDueno(inner, tel);
+    });
+    return kept.join(' · ').trim().slice(0, 280);
+}
+
+const ORIGEN_ENTREGA_AGENDA_LEGIBLE = {
+    panel: 'Panel (agenda)',
+    gemini_entrega: 'Vicky (marcador entrega)',
+    whatsapp_admin_entrega: 'WhatsApp admin (#entrega)',
+    whatsapp_admin_entrega_gemini: 'WhatsApp admin (#entrega + Gemini)',
+    whatsapp_admin_menu_entrega: 'WhatsApp admin (menú 3)',
+};
+
+function origenEntregaAgendaLegible(origen) {
+    const k = String(origen || '').trim();
+    return ORIGEN_ENTREGA_AGENDA_LEGIBLE[k] || k;
+}
+
 async function resolverJidGrupoAgendaOperativo(raw, sock) {
     const prelim = normalizarJidGrupoAgendaEntregas(raw);
     if (prelim) return prelim;
@@ -964,18 +1003,42 @@ async function resolverJidGrupoAgendaOperativo(raw, sock) {
     }
 }
 
-function textoNotificacionEntregaAgendaEnGrupo(docId, d) {
+function textoNotificacionEntregaAgendaEnGrupo(docId, d, clienteDoc) {
     if (!d || typeof d !== 'object') return `📅 *Agenda de entregas* — id \`${docId}\``;
+    const telDoc = d.telefonoContacto && String(d.telefonoContacto).trim()
+        ? soloDigitosTel(d.telefonoContacto)
+        : '';
+    const telAviso = telefonoLegibleParaAvisoEntrega(d, clienteDoc);
+    const nombreCliente =
+        (clienteDoc && clienteDoc.nombre && String(clienteDoc.nombre).trim()) ||
+        (clienteDoc && clienteDoc.pushName && String(clienteDoc.pushName).trim()) ||
+        '';
+    const nombreMuestra =
+        nombreCliente
+        && !(textoPareceSoloTelefono(nombreCliente) && telAviso)
+            ? nombreCliente
+            : '';
+    const jidStr = d.jid ? String(d.jid).trim() : '';
+    const esLid = jidStr.endsWith('@lid');
+    const lineaChat =
+        telAviso || (esLid && !telAviso)
+            ? ''
+            : d.jid
+              ? `💬 Chat: \`${String(d.jid)}\``
+              : '';
     const lines = ['📅 *Nueva entrada en agenda de entregas*', ''];
     if (d.fechaDia) lines.push(`📆 Día: *${String(d.fechaDia)}*`);
     if (d.horaTexto) lines.push(`🕐 Hora: ${String(d.horaTexto)}`);
     lines.push(`📝 ${String(d.titulo || '—').slice(0, 400)}`);
-    if (d.origen) lines.push(`📎 Origen: _${String(d.origen)}_`);
-    if (d.telefonoContacto) lines.push(`📞 Contacto: \`${String(d.telefonoContacto)}\``);
+    if (d.origen) lines.push(`📎 Origen: _${origenEntregaAgendaLegible(d.origen)}_`);
+    if (telAviso) lines.push(`📞 Contacto: \`${String(telAviso)}\``);
+    else if (esLid) lines.push('📞 Contacto: _ver panel / CRM (chat LID)_');
+    if (nombreMuestra) lines.push(`👤 ${String(nombreMuestra).slice(0, 120)}`);
     if (d.direccion) lines.push(`📍 ${String(d.direccion).slice(0, 220)}`);
     if (d.producto) lines.push(`📦 ${String(d.producto).slice(0, 220)}`);
-    if (d.notas) lines.push(`ℹ️ ${String(d.notas).slice(0, 280)}`);
-    if (d.jid) lines.push(`💬 Chat: \`${String(d.jid)}\``);
+    const notasGrupo = notasEntregaAgendaParaAvisoGrupo(d.notas, telDoc || telAviso);
+    if (notasGrupo) lines.push(`ℹ️ ${notasGrupo}`);
+    if (lineaChat) lines.push(lineaChat);
     lines.push('', `\`id:${docId}\``);
     return lines.join('\n').slice(0, 3800);
 }
@@ -1027,7 +1090,13 @@ async function intentarNotificarNuevaEntregaAgendaGrupo(docId, opts = {}) {
         await firestoreModule.revertEntregaAgendaNotificacionGrupo(docId);
         return;
     }
-    const text = textoNotificacionEntregaAgendaEnGrupo(docId, d);
+    let clienteDocAviso = null;
+    if (d.jid && firestoreModule.getClienteDocDataParaAvisoAgenda) {
+        try {
+            clienteDocAviso = await firestoreModule.getClienteDocDataParaAvisoAgenda(String(d.jid).trim());
+        } catch (_) {}
+    }
+    const text = textoNotificacionEntregaAgendaEnGrupo(docId, d, clienteDocAviso);
     const sock = vickySocketRef.current;
     if (sock && typeof sock.groupMetadata === 'function') {
         try {
@@ -1441,7 +1510,7 @@ function normalizarTextoComandosAdmin(s) {
 function esMensajeHashComandoAdmin(textoNorm) {
     const t = String(textoNorm || '').trim().replace(/\*/g, '');
     return (
-        /^#\s*(reporte\b|pedido(\s|$)|p(\+|\-|\s|lidmap\s)|g(\s|$)|ruta_geo\s|ruta\s|c(\s|$)|entrega\s|enviar\s|silencio\s|silenciar(\s|$)|activar\s|activo\s|vicky\s|estado\s*$)/i.test(t)
+        /^#\s*(reporte\b|pedido(\s|$)|p(\+|\-|\s|lidmap\s)|g(\s|$)|ruta_geo\s|ruta\s|c(\s|$)|entrega\s|final_entrega(\s|$)|enviar\s|silencio\s|silenciar(\s|$)|activar\s|activo\s|vicky\s|estado\s*$)/i.test(t)
         || /^#\s*p\s+lidmap\b/i.test(t)
         || /^#\s*plidmap(?=[\s\d])/i.test(t)
     );
@@ -1462,6 +1531,7 @@ function normalizarAliasesComandoAdminRaw(s) {
     if (/^!!\s*ruta(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
     if (/^!!\s*c(\s|$)/i.test(t)) return t.replace(/^!!\s*c/i, '#c');
     if (/^!!\s*g(\s|$)/i.test(t)) return t.replace(/^!!\s*g/i, '#g');
+    if (/^!!\s*final_entrega(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
     if (/^!!\s*entrega(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
     if (/^!!\s*enviar(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
     if (/^!!\s*silencio(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
@@ -1493,7 +1563,7 @@ function textoPareceComandoAdmin(t) {
     if (/^\*\d{4}$/.test(s)) return true;
     if (/^\d{10,15}$/.test(s)) return true;
     if (/^(mand[áa]|dec[ií]le|decile|avis[aá]le|avisale|pregunt[aá]le|preguntale|inform[aá]le|informale|envi[aá]le|enviale|cont[aá]le|contale|escrib[ií]le|escribile)\b/i.test(s)) return true;
-    if (/^#\s*(c|g|ruta_geo|ruta|reporte|pedido|p(\+|\-|\s|lidmap\b)|entrega|salir|enviar|silencio|silenciar|activar|activo|vicky)\b/i.test(s)) return true;
+    if (/^#\s*(c|g|ruta_geo|ruta|reporte|pedido|p(\+|\-|\s|lidmap\b)|entrega|final_entrega|salir|enviar|silencio|silenciar|activar|activo|vicky)\b/i.test(s)) return true;
     if (/^#\s*estado\s*$/i.test(s)) return true;
     if (/^(#d|#detalle|detalle)\s/i.test(s)) return true;
     if (/^(ok|dale|s[íi]|listo|guardar|confirmo)\s*$/i.test(s)) return true;
@@ -1554,7 +1624,7 @@ function debeEntrarModoAdmin(msg, remoteJid, textoRaw, tieneAudioMsg) {
     if (t.startsWith(ADMIN_SECRET)) return true;
     if (t === ADMIN_EXIT_COMMAND || t === '#salir') return true;
     if (
-        /^#\s*(g|ruta_geo|ruta|c|reporte|pedido|p(\+|\-|\s)|entrega|salir|enviar|silencio|silenciar|activar|activo|vicky)\b/.test(t)
+        /^#\s*(g|ruta_geo|ruta|c|reporte|pedido|p(\+|\-|\s)|entrega|final_entrega|salir|enviar|silencio|silenciar|activar|activo|vicky)\b/.test(t)
         || /^#\s*p\s+lidmap\b/i.test(t)
         || /^#\s*plidmap(?=[\s\d])/i.test(t)
     ) {
@@ -2011,8 +2081,8 @@ async function resolverDestinatarioAdmin(texto, sesionAdmin) {
         return null;
     }
 
-    // ── Número de teléfono (solo dígitos, guiones y espacios)
-    const soloDigitos = t.replace(/[\s\-().]/g, '');
+    // ── Número de teléfono (dígitos; también +, guiones, espacios, paréntesis)
+    const soloDigitos = t.replace(/[\s+\-().]/g, '');
     if (/^\d{6,}$/.test(soloDigitos)) {
         let tel = soloDigitos;
         if (!tel.startsWith('54') && tel.length <= 12) tel = '54' + tel;
@@ -2822,6 +2892,242 @@ function telefonoLineaParaFirestore(remoteJid, cliente) {
     }
     const d = soloDigitosTel(getTel(remoteJid));
     return d.length >= 8 ? d : null;
+}
+
+
+/** Fecha local Argentina (Córdoba) de mañana en formato YYYY-MM-DD. */
+function fechaIsoManianaArgentina() {
+    try {
+        const tz = 'America/Argentina/Cordoba';
+        const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
+        const t = new Date();
+        t.setDate(t.getDate() + 1);
+        const parts = fmt.formatToParts(t);
+        const y = parts.find((p) => p.type === 'year')?.value;
+        const m = parts.find((p) => p.type === 'month')?.value;
+        const d = parts.find((p) => p.type === 'day')?.value;
+        if (y && m && d) return `${y}-${m}-${d}`;
+    } catch (_) {}
+    const t = new Date();
+    t.setDate(t.getDate() + 1);
+    return t.toISOString().slice(0, 10);
+}
+
+/** Nombre/pushName que en realidad es un teléfono (mal cargado en CRM) — no usar como título ni “Nombre:”. */
+function textoPareceSoloTelefono(s) {
+    const raw = String(s || '').trim();
+    if (!raw) return false;
+    const letters = raw.replace(/[^a-záéíóúüñA-ZÁÉÍÓÚÜÑ]/g, '').length;
+    if (letters >= 3) return false;
+    return raw.replace(/\D/g, '').length >= 10;
+}
+
+function tituloSugeridoEntregaDesdeCliente(c, etiquetaDest) {
+    let nombre = (c?.nombre && String(c.nombre).trim()) || (c?.pushName && String(c.pushName).trim()) || '';
+    if (nombre && textoPareceSoloTelefono(nombre)) nombre = '';
+    const interes = Array.isArray(c?.interes)
+        ? c.interes.filter(Boolean).map((x) => String(x).trim()).filter(Boolean).join(', ')
+        : c?.interes && String(c.interes).trim();
+    const prod = (c?.producto && String(c.producto).trim()) || '';
+    const sp = c?.servicioPendiente && String(c.servicioPendiente).trim();
+    const partes = [];
+    if (nombre) partes.push(nombre);
+    if (sp) partes.push(sp);
+    if (interes) partes.push(interes);
+    if (prod) partes.push(prod);
+    const base = partes.join(' · ').trim();
+    if (base) return base;
+    const et = etiquetaDest != null ? String(etiquetaDest).trim() : '';
+    if (et && !textoPareceSoloTelefono(et)) return et.slice(0, 200);
+    return 'Entrega';
+}
+
+/** Teléfono a guardar en entregas_agenda.telefonoContacto (fallback dígitos admin / @s). */
+function telefonoContactoParaEntregaAgenda(remoteJid, cliente, digitosFallback) {
+    const tf = telefonoLineaParaFirestore(remoteJid, cliente);
+    if (tf) return tf;
+    const dig = String(digitosFallback || '').replace(/\D/g, '');
+    if (dig.length >= 8) return dig.slice(0, 40);
+    if (remoteJid && String(remoteJid).endsWith('@s.whatsapp.net')) {
+        const solo = soloDigitosTel(getTel(remoteJid));
+        return solo.length >= 8 ? solo.slice(0, 40) : null;
+    }
+    return null;
+}
+
+function telefonoLegibleParaAvisoEntrega(entrega, clienteDoc) {
+    const tEnt = entrega && typeof entrega.telefonoContacto === 'string' ? entrega.telefonoContacto.trim() : '';
+    if (tEnt) return tEnt;
+    const tDoc = clienteDoc && typeof clienteDoc.telefono === 'string' ? clienteDoc.telefono.trim() : '';
+    const soloDoc = soloDigitosTel(tDoc);
+    if (soloDoc.length >= 8) return soloDoc;
+    const jid = entrega && typeof entrega.jid === 'string' ? entrega.jid.trim() : '';
+    if (jid.endsWith('@s.whatsapp.net')) {
+        const solo = soloDigitosTel(getTel(jid));
+        if (solo.length >= 8) return solo;
+    }
+    return '';
+}
+
+function sanitizarTextoCopiaAgenda(s) {
+    return String(s || '')
+        .replace(/[\*`~]/g, ' ')
+        .replace(/\r?\n+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function fusionarClienteMemoriaFirestore(mem, fd) {
+    const a = mem && typeof mem === 'object' ? mem : {};
+    const b = fd && typeof fd === 'object' ? fd : {};
+    return { ...b, ...a };
+}
+
+/** CRM para agenda: memoria local + doc `clientes/*` (Cloud Run suele tener memoria vacía). */
+async function clienteFusionadoFirestoreMemoria(remoteJid) {
+    const mem = getCliente(remoteJid);
+    if (!firestoreModule.isAvailable() || !firestoreModule.getClienteDocDataParaAvisoAgenda) {
+        return mem && typeof mem === 'object' ? mem : {};
+    }
+    try {
+        const fd = await firestoreModule.getClienteDocDataParaAvisoAgenda(String(remoteJid).trim());
+        return fusionarClienteMemoriaFirestore(mem, fd);
+    } catch (_) {
+        return mem && typeof mem === 'object' ? mem : {};
+    }
+}
+
+/** Texto único para línea Producto del bloque copiable (CRM + pedido). */
+function textoProductoBloqueAgenda(crm) {
+    const raw = [];
+    if (crm?.producto) raw.push(String(crm.producto).trim());
+    if (crm?.servicioPendiente) raw.push(String(crm.servicioPendiente).trim());
+    const pa = Array.isArray(crm?.pedidosAnteriores) && crm.pedidosAnteriores.length > 0 ? crm.pedidosAnteriores[crm.pedidosAnteriores.length - 1] : null;
+    if (pa?.descripcion) raw.push(String(pa.descripcion).trim());
+    if (crm?.textoCotizacion) raw.push(String(crm.textoCotizacion).trim());
+    if (crm?.tipoLenaPreferido) raw.push(`Leña: ${String(crm.tipoLenaPreferido).trim()}`);
+    const seen = new Set();
+    const out = [];
+    for (const r of raw) {
+        if (!r) continue;
+        const key = r.toLowerCase().replace(/\s+/g, ' ').slice(0, 120);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(sanitizarTextoCopiaAgenda(r.slice(0, 320)));
+    }
+    return out.length ? out.join(' · ').slice(0, 450) : '';
+}
+
+/**
+ * Bloque copiable: línea para Vicky + datos útiles (CRM / Firestore).
+ * @returns {string}
+ */
+function armarBloqueCopiaWizardAgenda({ crm, dest, telRef, lineaAgenda, jid }) {
+    const lines = [];
+    lines.push('=== AGENDA — copiar todo este mensaje ===');
+    lines.push('');
+    lines.push('>>> MANDÁ EN EL CHAT CON VICKY (una línea con fecha; podés pegar todo el bloque y el bot toma la línea de fecha):');
+    lines.push(lineaAgenda);
+    lines.push('');
+    lines.push('--- Datos del cliente ---');
+    const nombre =
+        (crm?.nombre && String(crm.nombre).trim()) ||
+        (crm?.pushName && String(crm.pushName).trim()) ||
+        '';
+    if (nombre && !textoPareceSoloTelefono(nombre)) {
+        lines.push(`Nombre: ${sanitizarTextoCopiaAgenda(nombre)}`);
+    }
+    const telMostrar =
+        telRef && String(telRef).trim() && telRef !== '—'
+            ? String(telRef).trim()
+            : crm?.telefono
+              ? soloDigitosTel(crm.telefono)
+              : '';
+    const telDigMostrar = String(telMostrar || '').replace(/\D/g, '');
+    const etRaw = dest?.etiqueta != null ? String(dest.etiqueta).trim() : '';
+    const etDig = etRaw.replace(/\D/g, '');
+    const etiquetaRedundante =
+        etRaw
+        && textoPareceSoloTelefono(etRaw)
+        && telDigMostrar.length >= 8
+        && telefonosMismoDueno(etDig, telDigMostrar);
+    if (etRaw && !etiquetaRedundante) {
+        lines.push(`Etiqueta / búsqueda: ${sanitizarTextoCopiaAgenda(etRaw)}`);
+    }
+    if (telMostrar && String(telMostrar).replace(/\D/g, '').length >= 8) {
+        lines.push(`Tel: ${sanitizarTextoCopiaAgenda(telMostrar)}`);
+    }
+    const dirRaw = crm?.direccion && String(crm.direccion).trim();
+    const prodArmado = textoProductoBloqueAgenda(crm);
+    lines.push('');
+    lines.push('--- Dirección y producto ---');
+    lines.push(dirRaw ? `Dirección: ${sanitizarTextoCopiaAgenda(dirRaw.slice(0, 420))}` : 'Dirección:');
+    lines.push(prodArmado ? `Producto: ${prodArmado}` : 'Producto:');
+    const interesTxt = Array.isArray(crm?.interes)
+        ? crm.interes.filter(Boolean).map((x) => String(x).trim()).filter(Boolean).join(', ')
+        : crm?.interes && String(crm.interes).trim();
+    const hayUbi =
+        !!(crm?.zona || crm?.barrio || crm?.localidad || crm?.referencia || crm?.notasUbicacion || interesTxt);
+    if (hayUbi) {
+        lines.push('');
+        lines.push('--- Ubicación y contexto ---');
+        if (crm?.zona) lines.push(`Zona: ${sanitizarTextoCopiaAgenda(String(crm.zona).slice(0, 160))}`);
+        if (crm?.barrio) lines.push(`Barrio: ${sanitizarTextoCopiaAgenda(String(crm.barrio).slice(0, 160))}`);
+        if (crm?.localidad) lines.push(`Localidad: ${sanitizarTextoCopiaAgenda(String(crm.localidad).slice(0, 160))}`);
+        if (crm?.referencia) lines.push(`Referencia: ${sanitizarTextoCopiaAgenda(String(crm.referencia).slice(0, 240))}`);
+        if (crm?.notasUbicacion) {
+            lines.push(`Notas ubicación: ${sanitizarTextoCopiaAgenda(String(crm.notasUbicacion).slice(0, 280))}`);
+        }
+        if (interesTxt) lines.push(`Interés: ${sanitizarTextoCopiaAgenda(interesTxt.slice(0, 220))}`);
+    }
+    lines.push('');
+    if (crm?.estado) lines.push(`Estado CRM: ${sanitizarTextoCopiaAgenda(String(crm.estado).slice(0, 80))}`);
+    if (crm?.statusCrm) lines.push(`Status: ${sanitizarTextoCopiaAgenda(String(crm.statusCrm).slice(0, 80))}`);
+    if (jid) lines.push(`Chat interno (JID): ${sanitizarTextoCopiaAgenda(String(jid).slice(0, 120))}`);
+    lines.push('');
+    lines.push('=== fin ===');
+    return lines.join('\n').slice(0, 3900);
+}
+
+/**
+ * Si el admin pega el bloque completo, toma dirección/producto de líneas `Dirección:` / `Producto:`.
+ * Ignora valores tipo placeholder "(sin dato…)".
+ */
+function extraerDireccionProductoDesdePegadoAgendaAdmin(texto) {
+    const raw = String(texto || '');
+    const esPlaceholder = (v) => {
+        const s = String(v || '').trim();
+        if (!s) return true;
+        if (/^\(\s*sin\b/i.test(s)) return true;
+        if (/^[\(\[]\s*sin\b/i.test(s)) return true;
+        if (/^\(\s*acá\b/i.test(s)) return true;
+        if (/poner\s+direcci/i.test(s)) return true;
+        return false;
+    };
+    let direccion = null;
+    let producto = null;
+    const mDir = raw.match(/^\s*Dirección:\s*(.+)$/im);
+    if (mDir && !esPlaceholder(mDir[1])) {
+        direccion = sanitizarTextoCopiaAgenda(String(mDir[1]).trim().slice(0, 500));
+    }
+    const mProd = raw.match(/^\s*Producto:\s*(.+)$/im);
+    if (mProd && !esPlaceholder(mProd[1])) {
+        producto = sanitizarTextoCopiaAgenda(String(mProd[1]).trim().slice(0, 500));
+    }
+    return { direccion, producto };
+}
+
+/** Primera línea del texto que coincide con AAAA-MM-DD HH:mm|-- … título (permite pegar bloque multilínea). */
+function matchLineaEntregaAgendaAdmin(texto) {
+    const raw = String(texto || '').trim();
+    if (!raw) return null;
+    const re = /^(\d{4}-\d{2}-\d{2})\s+(\S+)\s+(.+)$/;
+    const lineas = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    for (const ln of lineas) {
+        const m = ln.match(re);
+        if (m) return m;
+    }
+    return raw.match(/^(\d{4}-\d{2}-\d{2})\s+(\S+)\s+([\s\S]+)$/);
 }
 
 /** Id de documento Firestore `clientes/{id}`: línea real si se conoce; si no, clave de historial (LID / ig:). */
@@ -4245,7 +4551,7 @@ async function connectToWhatsApp(isReconnect = false) {
                     await sendBotMessage(remoteJid, {
                         text: '🔐 Comando de administración no habilitado en este chat.\n\n'
                             + '• Frase secreta (ADMIN_SECRET) y *después* el comando.\n'
-                            + '• Comandos: *#g* / *!!g* / *vicky:g* (instructivo Gemini), *#c* / *!!c* (puente cliente), *#entrega* / *!!entrega* (cargar agenda con *#c* o JID; *#entrega lista* / *lista todas* para ver próximos eventos), *#reporte* + *detalle …*, *#p* (*lista* / *lidmap* / *tel* / *+tel* / *-tel* / *N*), *#pedido* …, *#ruta* / *!!ruta*, *#ruta_geo* / *!!ruta_geo* (campaña por polilínea en panel), *#enviar …*, *#estado* / *!!estado*, *#silencio global* / *#activo global* / *#activo parcial*, *#silenciar …* / *!!silenciar …* / *#activar …*…\n'
+                            + '• Comandos: *#g* / *!!g* / *vicky:g* (instructivo Gemini), *#c* / *!!c* (puente cliente), *#entrega* / *!!entrega* (cargar agenda con *#c* o JID; *#entrega lista* / *lista todas* para ver próximos eventos), *#final_entrega* / *!!final_entrega* (cierre datos de entrega tras humano), *#reporte* + *detalle …*, *#p* (*lista* / *lidmap* / *tel* / *+tel* / *-tel* / *N*), *#pedido* …, *#ruta* / *!!ruta*, *#ruta_geo* / *!!ruta_geo* (campaña por polilínea en panel), *#enviar …*, *#estado* / *!!estado*, *#silencio global* / *#activo global* / *#activo parcial*, *#silenciar …* / *!!silenciar …* / *#activar …*…\n'
                             + '• *Teléfono admin* en panel + *ADMIN_PHONE* en servidor si querés sin frase secreta.\n\n'
                             + '_La sesión admin se guarda en Firestore (varias réplicas Cloud Run)._'
                     });
@@ -4257,6 +4563,17 @@ async function connectToWhatsApp(isReconnect = false) {
                     if (esFraseAdmin) {
                         const colaSecreta = textoRaw.slice(ADMIN_SECRET.length).trim();
                         const existing = adminSesionesActivas.get(remoteJid) || {};
+                        const soloOpcionMenuNum = /^[1-4]\s*$/i.test(colaSecreta);
+                        const soloMenuKeyword = /^menu$/i.test(colaSecreta);
+                        const soloMenuTrasSecreta = soloOpcionMenuNum || soloMenuKeyword;
+                        const preservarWizardAgenda =
+                            existing.wizard &&
+                            existing.wizard.tipo === 'agenda_entrega' &&
+                            colaSecreta &&
+                            !soloMenuTrasSecreta;
+                        const wizardSiguiente = preservarWizardAgenda
+                            ? JSON.parse(JSON.stringify(existing.wizard))
+                            : null;
                         adminSesionesActivas.set(remoteJid, {
                             activadoEn: Date.now(),
                             listaClientes: existing.listaClientes || {},
@@ -4266,8 +4583,8 @@ async function connectToWhatsApp(isReconnect = false) {
                             esperandoSelectorPuente: false,
                             esperandoInstructivoGemini: false,
                             borradorGeminiPreview: null,
-                            esperandoMenuPrincipal: !colaSecreta,
-                            wizard: null,
+                            esperandoMenuPrincipal: !colaSecreta || soloMenuTrasSecreta,
+                            wizard: wizardSiguiente,
                             ultimoReporteIndice: existing.ultimoReporteIndice ?? null,
                             ultimoReporteAt: existing.ultimoReporteAt ?? null,
                             pListaIndex: existing.pListaIndex ?? null,
@@ -4355,25 +4672,92 @@ async function connectToWhatsApp(isReconnect = false) {
                             w.paso = 'detalle';
                             w.jid = dest.jid;
                             w.etiqueta = dest.etiqueta;
+                            const soloDigTelWizard = ttW.replace(/\D/g, '');
+                            w.digitosIngresados = soloDigTelWizard.length >= 8 ? soloDigTelWizard.slice(0, 40) : null;
+                            if (w.digitosIngresados) {
+                                w.etiqueta = w.digitosIngresados;
+                            }
+                            const memCli = getCliente(dest.jid);
+                            let fdCli = null;
+                            if (firestoreModule.isAvailable() && firestoreModule.getClienteDocDataParaAvisoAgenda) {
+                                try {
+                                    fdCli = await firestoreModule.getClienteDocDataParaAvisoAgenda(String(dest.jid).trim());
+                                } catch (_) {}
+                            }
+                            let fdPorDig = null;
+                            if (
+                                soloDigTelWizard.length >= 8
+                                && firestoreModule.isAvailable()
+                                && firestoreModule.getClienteDocDataCoincidenteSoloDigitos
+                            ) {
+                                try {
+                                    fdPorDig = await firestoreModule.getClienteDocDataCoincidenteSoloDigitos(soloDigTelWizard);
+                                    if (fdPorDig) fdCli = fdPorDig;
+                                } catch (_) {}
+                            }
+                            const crmTpl = fdPorDig
+                                ? { ...(memCli && typeof memCli === 'object' ? memCli : {}), ...fdPorDig }
+                                : fusionarClienteMemoriaFirestore(memCli, fdCli);
+                            const telLineaResuelta = telefonoLineaParaFirestore(dest.jid, crmTpl);
+                            const mismatchTelJid =
+                                !!(
+                                    w.digitosIngresados
+                                    && telLineaResuelta
+                                    && !telefonosMismoDueno(w.digitosIngresados, telLineaResuelta)
+                                );
+                            const fechaM = fechaIsoManianaArgentina();
+                            const titSugRaw = mismatchTelJid
+                                ? 'Entrega'
+                                : tituloSugeridoEntregaDesdeCliente(crmTpl, w.etiqueta);
+                            const crmBloqueCopia = mismatchTelJid
+                                ? { ...crmTpl, nombre: null, pushName: null }
+                                : crmTpl;
+                            const titSugSafe = String(titSugRaw || '')
+                                .replace(/[\n\r]+/g, ' ')
+                                .replace(/[`]/g, "'")
+                                .replace(/\*/g, '·')
+                                .replace(/_/g, ' ')
+                                .replace(/\s+/g, ' ')
+                                .trim();
+                            const lineaCopiar = `${fechaM} 09:00 ${titSugSafe || 'Entrega'}`.slice(0, 480);
+                            const telRef = w.digitosIngresados
+                                ? String(w.digitosIngresados).replace(/\D/g, '').slice(0, 40)
+                                : telefonoContactoParaEntregaAgenda(dest.jid, crmTpl, w.digitosIngresados) ||
+                                  '—';
+                            const destBloque = { ...dest, etiqueta: w.etiqueta };
+                            const bloqueCopia = armarBloqueCopiaWizardAgenda({
+                                crm: crmBloqueCopia,
+                                dest: destBloque,
+                                telRef,
+                                lineaAgenda: lineaCopiar,
+                                jid: dest.jid,
+                            });
                             await sendBotMessage(remoteJid, {
                                 text:
-                                    `📅 *Agenda de entregas* → *${dest.etiqueta}*\n\n`
-                                    + 'En *una línea* mandá fecha, hora (o `--`) y título:\n'
-                                    + '• `YYYY-MM-DD HH:mm título`\n'
-                                    + '• `YYYY-MM-DD -- título` (todo el día)\n\n'
-                                    + 'Ej: `2026-04-10 09:00 Entrega 1 tn leña`\n\n'
-                                    + 'Después te pido *OK* para guardar o *NO* para cancelar.\n'
-                                    + '_*menu*_ — menú principal.',
+                                    `📅 *Agenda de entregas* → *${w.etiqueta}*\n\n`
+                                    + '📋 *Siguiente mensaje:* bloque con la *línea de agenda* y lo que traiga el CRM. *Copiá* ese mensaje entero.\n\n'
+                                    + 'Luego *pegá* acá: el bot toma la *primera línea* que empiece con `AAAA-MM-DD`. '
+                                    + 'Podés editar fecha, hora o título en esa línea antes de enviar.\n\n'
+                                    + 'Después te pido *OK* / *NO*. _*menu*_ — menú principal.',
                             });
+                            await sendBotMessage(remoteJid, { text: bloqueCopia });
+                            if (mismatchTelJid) {
+                                await sendBotMessage(remoteJid, {
+                                    text:
+                                        '⚠️ *Aviso:* el chat de WhatsApp resuelto y el número que escribiste *no son el mismo*. '
+                                        + 'En el bloque se priorizó el número tipeado; revisá CRM o mapeo LID si hace falta.',
+                                });
+                            }
                             persistAdminWaSessionFirestore(remoteJid).catch(() => {});
                             return;
                         }
                         if (w.paso === 'detalle') {
-                            const mDet = ttW.match(/^(\d{4}-\d{2}-\d{2})\s+(\S+)\s+([\s\S]+)$/);
+                            const mDet = matchLineaEntregaAgendaAdmin(ttW);
                             if (!mDet) {
                                 await sendBotMessage(remoteJid, {
                                     text:
-                                        '❌ Formato: `AAAA-MM-DD HH:mm título` o `AAAA-MM-DD -- título`.\n'
+                                        '❌ Tiene que haber *una línea* con: `AAAA-MM-DD HH:mm título` o `AAAA-MM-DD -- título`.\n'
+                                        + 'Si pegaste el bloque entero, revisá que esa línea esté (la primera que empiece con el año).\n'
                                         + '_*menu*_ — volver.',
                                 });
                                 return;
@@ -4389,10 +4773,13 @@ async function connectToWhatsApp(isReconnect = false) {
                             w.fechaDia = fechaDia;
                             w.horaTexto = horaRaw && horaRaw !== '--' ? horaRaw : null;
                             w.titulo = tituloEnt;
+                            const peg = extraerDireccionProductoDesdePegadoAgendaAdmin(ttW);
+                            w.direccionPegada = peg.direccion || null;
+                            w.productoPegada = peg.producto || null;
                             await sendBotMessage(remoteJid, {
                                 text:
                                     `📋 *Confirmar agenda*\n• Cliente: *${w.etiqueta}*\n• Día: \`${fechaDia}\`\n`
-                                    + (w.horaTexto ? `• Hora: \`${w.horaTexto}\`\n` : '• Hora: (día completo / sin hora)\n')
+                                    + (w.horaTexto ? `• Hora: \`${w.horaTexto}\`\n` : '• Hora: todo el día\n')
                                     + `• _${tituloEnt.length > 380 ? `${tituloEnt.slice(0, 380)}…` : tituloEnt}_\n\n`
                                     + '✅ *OK* — guardar en calendario y CRM\n❌ *NO* — cancelar',
                             });
@@ -4421,18 +4808,45 @@ async function connectToWhatsApp(isReconnect = false) {
                                 const fechaDia = w.fechaDia;
                                 const horaTexto = w.horaTexto;
                                 const tituloEnt = w.titulo;
-                                const cliEnt = getCliente(targetJid);
-                                const telC = telefonoLineaParaFirestore(targetJid, cliEnt);
-                                const productoParts = [];
-                                if (cliEnt?.servicioPendiente) productoParts.push(String(cliEnt.servicioPendiente));
-                                const paE = cliEnt?.pedidosAnteriores;
-                                if (Array.isArray(paE) && paE.length > 0) {
-                                    const u = paE[paE.length - 1]?.descripcion;
-                                    if (u) productoParts.push(String(u).slice(0, 220));
+                                const cliEnt = await clienteFusionadoFirestoreMemoria(targetJid);
+                                const productoStrRaw = textoProductoBloqueAgenda(cliEnt);
+                                const productoStr = (
+                                    productoStrRaw
+                                        ? productoStrRaw.slice(0, 500)
+                                        : w.productoPegada
+                                          ? String(w.productoPegada).slice(0, 500)
+                                          : null
+                                );
+                                const nombreCli =
+                                    (cliEnt?.nombre && String(cliEnt.nombre).trim()) ||
+                                    (cliEnt?.pushName && String(cliEnt.pushName).trim()) ||
+                                    '';
+                                const telAg = w.digitosIngresados
+                                    ? String(w.digitosIngresados).replace(/\D/g, '').slice(0, 40)
+                                    : telefonoContactoParaEntregaAgenda(targetJid, cliEnt, w.digitosIngresados);
+                                let lineaClienteNotas = null;
+                                if (nombreCli) {
+                                    if (textoPareceSoloTelefono(nombreCli)) {
+                                        if (telAg && telefonosMismoDueno(nombreCli, telAg)) {
+                                            lineaClienteNotas = null;
+                                        }
+                                    } else {
+                                        lineaClienteNotas = `Cliente: ${nombreCli}`;
+                                    }
                                 }
-                                const productoStr = productoParts.length ? productoParts.join(' — ') : null;
-                                const notasParts = [cliEnt?.zona, cliEnt?.notasUbicacion].filter(Boolean);
-                                const notasStr = notasParts.length ? notasParts.join(' · ') : null;
+                                const notasParts = [
+                                    lineaClienteNotas,
+                                    cliEnt?.zona,
+                                    cliEnt?.barrio,
+                                    cliEnt?.localidad,
+                                    cliEnt?.notasUbicacion,
+                                ].filter(Boolean);
+                                const notasStr = notasParts.length ? notasParts.join(' · ').slice(0, 2000) : null;
+                                const dirCrm =
+                                    cliEnt?.direccion && String(cliEnt.direccion).trim()
+                                        ? String(cliEnt.direccion).trim().slice(0, 500)
+                                        : '';
+                                const dirStr = dirCrm || (w.direccionPegada ? String(w.direccionPegada).slice(0, 500) : null);
                                 const idAg = await firestoreModule.addEntregaAgenda({
                                     jid: targetJid,
                                     fechaDia,
@@ -4441,8 +4855,8 @@ async function connectToWhatsApp(isReconnect = false) {
                                     notas: notasStr,
                                     kg: null,
                                     origen: 'whatsapp_admin_menu_entrega',
-                                    telefonoContacto: telC,
-                                    direccion: cliEnt?.direccion || null,
+                                    telefonoContacto: telAg,
+                                    direccion: dirStr,
                                     producto: productoStr,
                                 });
                                 sesion.wizard = null;
@@ -4457,8 +4871,9 @@ async function connectToWhatsApp(isReconnect = false) {
                                 await sendBotMessage(remoteJid, {
                                     text:
                                         `✅ *Agenda de entregas* guardada\n• Día: \`${fechaDia}\`\n`
-                                        + (horaTexto ? `• Hora: \`${horaTexto}\`\n` : '• Hora: (todo el día)\n')
+                                        + (horaTexto ? `• Hora: \`${horaTexto}\`\n` : '• Hora: todo el día\n')
                                         + `• \`${tituloEnt.length > 200 ? `${tituloEnt.slice(0, 200)}…` : tituloEnt}\`\n`
+                                        + (telAg ? `• 📞 \`${telAg}\`\n` : '')
                                         + `• Chat: \`${targetJid}\`\n`
                                         + '_Panel → Agenda de entregas._\n\n'
                                         + ADMIN_MENU_PRINCIPAL_MSG,
@@ -4503,7 +4918,7 @@ async function connectToWhatsApp(isReconnect = false) {
                             return;
                         } else if (/^3\s*$/i.test(ttM)) {
                             sesion.esperandoMenuPrincipal = false;
-                            sesion.wizard = { tipo: 'agenda_entrega', paso: 'tel', jid: null, etiqueta: null };
+                            sesion.wizard = { tipo: 'agenda_entrega', paso: 'tel', jid: null, etiqueta: null, digitosIngresados: null };
                             await sendBotMessage(remoteJid, {
                                 text:
                                     '📅 *Agenda de entregas*\n\n'
@@ -4517,7 +4932,7 @@ async function connectToWhatsApp(isReconnect = false) {
                             await sendBotMessage(remoteJid, {
                                 text:
                                     '⚙️ *Más comandos*\n\n'
-                                    + 'Podés escribirlos directo: *#reporte*, *#p lista*, *#c*, *#ruta*, *#entrega*, *#g*, *#enviar* …\n\n'
+                                    + 'Podés escribirlos directo: *#reporte*, *#p lista*, *#c*, *#ruta*, *#entrega*, *#final_entrega*, *#g*, *#enviar* …\n\n'
                                     + '_*menu*_ — volver al menú numerado._',
                             });
                             persistAdminWaSessionFirestore(remoteJid).catch(() => {});
@@ -5242,7 +5657,7 @@ async function connectToWhatsApp(isReconnect = false) {
                                     + '• *Nombre* del contacto\n'
                                     + '• *Número completo* con código de país\n'
                                     + '• *último* → el que escribió más reciente\n\n'
-                                    + 'Después: *texto o audio* para el cliente, o *#entrega* para cargar el día en **Agenda de entregas**.'
+                                    + 'Después: *texto o audio* para el cliente, *#entrega* para cargar el día en **Agenda de entregas**, o *#final_entrega* para que Vicky cierre datos de entrega tras el humano.'
                             });
                             return;
                         }
@@ -5262,8 +5677,65 @@ async function connectToWhatsApp(isReconnect = false) {
                                 text: `🌉 *Modo puente* → *${dest.etiqueta}*\n`
                                     + 'Mandá *texto o audio* con lo que querés que Vicky le diga (Gemini lo redacta y lo envía).\n'
                                     + '*#entrega* con fecha + hora + título → calendario **Agenda de entregas** (Firestore).\n'
+                                    + '*#final_entrega* → quita silencio humano, mensaje al cliente y Vicky pide datos con `[ENTREGA:…]`.\n'
                                     + 'Otro cliente: *#c*. Salir: *#SALIR* / *adminoff*.'
                             });
+                            return;
+                        }
+                        const mFinalEntrega = tAdm.match(/^#\s*final_entrega(?:\s+([\s\S]+))?\s*$/i);
+                        if (mFinalEntrega && !tieneAudioMsg) {
+                            sesion.destinatarioPendiente = null;
+                            limpiarCapturasGemini();
+                            if (!firestoreModule.isAvailable()) {
+                                await sendBotMessage(remoteJid, { text: '❌ Firestore no disponible.' });
+                                return;
+                            }
+                            const restFe = (mFinalEntrega[1] || '').trim();
+                            let targetJid = null;
+                            let etiqueta = '';
+                            if (sesion.modoBridge && sesion.bridgeTarget?.jid) {
+                                targetJid = sesion.bridgeTarget.jid;
+                                etiqueta = sesion.bridgeTarget.etiqueta || targetJid;
+                            } else if (restFe) {
+                                const destFe = await resolverDestinatarioAdmin(restFe, sesion);
+                                if (!destFe) {
+                                    await sendBotMessage(remoteJid, {
+                                        text: '❌ No encontré ese contacto. Probá *#c* + cliente y luego *#final_entrega*, o *#final_entrega* + nombre/tel/#n.',
+                                    });
+                                    return;
+                                }
+                                targetJid = destFe.jid;
+                                etiqueta = destFe.etiqueta || targetJid;
+                            } else {
+                                await sendBotMessage(remoteJid, {
+                                    text: '❌ *#final_entrega* necesita cliente: primero *#c* (puente) o mandá *#final_entrega* + nombre, número o *#n*.\n'
+                                        + '*!!final_entrega* si WhatsApp rompe el #.',
+                                });
+                                return;
+                            }
+                            if (String(targetJid).startsWith('ig:')) {
+                                await sendBotMessage(remoteJid, {
+                                    text: '❌ *#final_entrega* aplica solo a WhatsApp, no a Instagram.',
+                                });
+                                return;
+                            }
+                            await firestoreModule.quitarHumanoAtendiendoChat(targetJid);
+                            const sFe = SESSIONS.get(targetJid);
+                            if (sFe) {
+                                sFe.humanAtendiendo = false;
+                                sFe.humanTimestamp = null;
+                            }
+                            await firestoreModule.setCierreEntregaAsistido(targetJid, true);
+                            const plantilla = await firestoreModule.getMensajeClienteCierreEntregaHumano(
+                                DEFAULT_MSJ_CLIENTE_CIERRE_ENTREGA_HUMANO
+                            );
+                            await sendBotMessage(targetJid, { text: plantilla });
+                            await sendBotMessage(remoteJid, {
+                                text: `✅ *Cierre asistido* → *${etiqueta}*\n`
+                                    + 'Se quitó silencio humano (sin tocar silencio de panel), se activó modo cierre y se envió el mensaje al cliente.\n'
+                                    + 'Vicky pedirá datos faltantes y agendará con `[ENTREGA:…]` como siempre.',
+                            });
+                            persistAdminWaSessionFirestore(remoteJid).catch(() => {});
                             return;
                         }
                         if (/^#entrega\s+lista\b/i.test(String(tAdm || '').trim()) && !tieneAudioMsg) {
@@ -5327,7 +5799,7 @@ async function connectToWhatsApp(isReconnect = false) {
                             }
                             const targetJid = dest.jid;
                             const items = await firestoreModule.getUltimosMensajesChatItems(targetJid, 30);
-                            const c = getCliente(targetJid);
+                            const c = await clienteFusionadoFirestoreMemoria(targetJid);
                             const crmParts = [];
                             if (c?.nombre) crmParts.push(`Nombre: ${c.nombre}`);
                             if (c?.pushName) crmParts.push(`pushName: ${c.pushName}`);
@@ -5341,7 +5813,7 @@ async function connectToWhatsApp(isReconnect = false) {
                                     crmParts.push(`Último pedido: ${String(u.descripcion).slice(0, 400)}`);
                                 }
                             }
-                            const crmResumen = crmParts.join('\n') || '(pocos datos en historial local del bot)';
+                            const crmResumen = crmParts.join('\n') || '';
                             await sendBotMessage(remoteJid, {
                                 text: `⏳ *#entrega* + tel → leo hilo y CRM de *${dest.etiqueta}* y pido fecha a Gemini…`,
                             });
@@ -5375,18 +5847,27 @@ async function connectToWhatsApp(isReconnect = false) {
                                 return;
                             }
                             const horaTexto = horaGem && horaGem !== '--' ? horaGem : null;
-                            const cliEnt = getCliente(targetJid);
-                            const telC = telefonoLineaParaFirestore(targetJid, cliEnt);
-                            const productoParts = [];
-                            if (cliEnt?.servicioPendiente) productoParts.push(String(cliEnt.servicioPendiente));
-                            const paE = cliEnt?.pedidosAnteriores;
-                            if (Array.isArray(paE) && paE.length > 0) {
-                                const u = paE[paE.length - 1]?.descripcion;
-                                if (u) productoParts.push(String(u).slice(0, 220));
-                            }
-                            const productoStr = productoParts.length ? productoParts.join(' — ') : null;
-                            const notasParts = [cliEnt?.zona, cliEnt?.notasUbicacion, notaDue || null].filter(Boolean);
-                            const notasStr = notasParts.length ? notasParts.join(' · ') : null;
+                            const cliEnt = await clienteFusionadoFirestoreMemoria(targetJid);
+                            const telGem = telefonoContactoParaEntregaAgenda(targetJid, cliEnt, soloTel);
+                            const productoStrRaw = textoProductoBloqueAgenda(cliEnt);
+                            const productoStr = productoStrRaw ? productoStrRaw.slice(0, 500) : null;
+                            const nombreGem =
+                                (cliEnt?.nombre && String(cliEnt.nombre).trim()) ||
+                                (cliEnt?.pushName && String(cliEnt.pushName).trim()) ||
+                                '';
+                            const notasParts = [
+                                nombreGem ? `Cliente: ${nombreGem}` : null,
+                                cliEnt?.zona,
+                                cliEnt?.barrio,
+                                cliEnt?.localidad,
+                                cliEnt?.notasUbicacion,
+                                notaDue || null,
+                            ].filter(Boolean);
+                            const notasStr = notasParts.length ? notasParts.join(' · ').slice(0, 2000) : null;
+                            const dirGem =
+                                cliEnt?.direccion && String(cliEnt.direccion).trim()
+                                    ? String(cliEnt.direccion).trim().slice(0, 500)
+                                    : null;
                             const idAg2 = await firestoreModule.addEntregaAgenda({
                                 jid: targetJid,
                                 fechaDia,
@@ -5395,8 +5876,8 @@ async function connectToWhatsApp(isReconnect = false) {
                                 notas: notasStr,
                                 kg: null,
                                 origen: 'whatsapp_admin_entrega_gemini',
-                                telefonoContacto: telC,
-                                direccion: cliEnt?.direccion || null,
+                                telefonoContacto: telGem,
+                                direccion: dirGem,
                                 producto: productoStr,
                             });
                             if (!idAg2) {
@@ -5406,8 +5887,9 @@ async function connectToWhatsApp(isReconnect = false) {
                             await sendBotMessage(remoteJid, {
                                 text:
                                     `✅ *Agenda* (Gemini + CRM + hilo)\n• Día: \`${fechaDia}\`\n`
-                                    + (horaTexto ? `• Hora: \`${horaTexto}\`\n` : '• Hora: (día completo / sin hora)\n')
+                                    + (horaTexto ? `• Hora: \`${horaTexto}\`\n` : '• Hora: todo el día\n')
                                     + `• \`${titGem.length > 200 ? `${titGem.slice(0, 200)}…` : titGem}\`\n`
+                                    + (telGem ? `• 📞 \`${telGem}\`\n` : '')
                                     + `• Chat: \`${targetJid}\`\n`
                                     + '_Panel → Agenda de entregas._',
                             });
@@ -5458,7 +5940,7 @@ async function connectToWhatsApp(isReconnect = false) {
                                 return;
                             }
                             const cliEnt = getCliente(targetJid);
-                            const telC = telefonoLineaParaFirestore(targetJid, cliEnt);
+                            const telMan = telefonoContactoParaEntregaAgenda(targetJid, cliEnt, null);
                             const productoParts = [];
                             if (cliEnt?.servicioPendiente) productoParts.push(String(cliEnt.servicioPendiente));
                             const paE = cliEnt?.pedidosAnteriores;
@@ -5477,7 +5959,7 @@ async function connectToWhatsApp(isReconnect = false) {
                                 notas: notasStr,
                                 kg: null,
                                 origen: 'whatsapp_admin_entrega',
-                                telefonoContacto: telC,
+                                telefonoContacto: telMan,
                                 direccion: cliEnt?.direccion || null,
                                 producto: productoStr,
                             });
@@ -5490,8 +5972,9 @@ async function connectToWhatsApp(isReconnect = false) {
                             await sendBotMessage(remoteJid, {
                                 text:
                                     `✅ *Agenda de entregas*\n• Día: \`${fechaDia}\`\n`
-                                    + (horaTexto ? `• Hora: \`${horaTexto}\`\n` : '• Hora: (todo el día / sin hora fija)\n')
+                                    + (horaTexto ? `• Hora: \`${horaTexto}\`\n` : '• Hora: todo el día\n')
                                     + `• \`${tituloEnt.length > 220 ? `${tituloEnt.slice(0, 220)}…` : tituloEnt}\`\n`
+                                    + (telMan ? `• 📞 \`${telMan}\`\n` : '')
                                     + `• Chat: \`${targetJid}\`\n`
                                     + '_Visible en el panel → Agenda de entregas._',
                             });
@@ -5590,7 +6073,7 @@ async function connectToWhatsApp(isReconnect = false) {
 
                     // Modo puente: reenviar al cliente (Gemini) salvo comandos # explícitos
                     if (sesion?.modoBridge && sesion.bridgeTarget && (tieneAudioMsg || tAdm)) {
-                        const esComandoHash = /^#\s*(g|ruta|c|reporte|salir|enviar|silencio|silenciar|activar|activo|vicky|entrega)\b/i.test(tAdm)
+                        const esComandoHash = /^#\s*(g|ruta|c|reporte|salir|enviar|silencio|silenciar|activar|activo|vicky|entrega|final_entrega)\b/i.test(tAdm)
                             || /^#\s*estado\s*$/i.test(tAdm);
                         if (tieneAudioMsg || (tAdm && !esComandoHash)) {
                             let audioB64 = null;
