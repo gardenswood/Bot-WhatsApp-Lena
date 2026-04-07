@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Helvetica Neue', Arial, sans-serif; font-size: 13px; color: #333; background: #fff; padding: 30px; }
+
+  /* Header */
+  .header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .logo-box { width: 42px; height: 42px; background: #2d5a27; border-radius: 8px; display: flex; align-items: center; justify-content: center; }
+  .logo-box svg { width: 28px; height: 28px; fill: white; }
+  .brand-text h1 { font-size: 20px; font-weight: 800; color: #1a3d16; letter-spacing: 1px; }
+  .brand-text p { font-size: 11px; color: #777; }
+  .doc-info { text-align: right; }
+  .doc-info h2 { font-size: 20px; font-weight: 800; color: #1a3d16; letter-spacing: 1px; }
+  .doc-info p { font-size: 12px; color: #777; margin-top: 2px; }
+
+  /* Cliente */
+  .client-bar { background: #f5f5f5; border-radius: 8px; padding: 12px 16px; margin-bottom: 20px; font-size: 13px; }
+  .client-bar span { font-weight: 600; }
+
+  /* Tabla */
+  table { width: 100%; border-collapse: collapse; margin-bottom: 24px; }
+  thead tr { background: #f9f9f9; border-bottom: 2px solid #e0e0e0; }
+  thead th { padding: 10px 12px; text-align: left; font-size: 12px; color: #666; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+  thead th:not(:first-child) { text-align: right; }
+  tbody tr { border-bottom: 1px solid #f0f0f0; }
+  tbody td { padding: 12px; vertical-align: middle; }
+  tbody td:not(:first-child) { text-align: right; }
+  .item-img { width: 48px; height: 48px; object-fit: cover; border-radius: 6px; margin-right: 10px; }
+  .item-main { display: flex; align-items: center; }
+  .item-desc h4 { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+  .item-desc p { font-size: 11px; color: #888; }
+  .descuento td { color: #c00; }
+  .total-row { font-weight: 700; }
+
+  /* Proceso */
+  .proceso { margin-bottom: 24px; }
+  .proceso h3 { font-size: 13px; font-weight: 800; color: #2d5a27; letter-spacing: 0.5px; text-transform: uppercase; border-top: 3px solid #2d5a27; padding-top: 12px; margin-bottom: 16px; }
+  .pasos { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  .paso h4 { font-size: 12px; font-weight: 700; margin-bottom: 8px; color: #1a3d16; }
+  .paso img { width: 100%; height: 160px; object-fit: cover; border-radius: 8px; margin-bottom: 8px; }
+  .paso ul { list-style: none; padding: 0; }
+  .paso ul li { font-size: 11px; color: #555; padding: 2px 0 2px 14px; position: relative; }
+  .paso ul li::before { content: '•'; position: absolute; left: 0; color: #2d5a27; }
+
+  /* Estilos */
+  .estilos h4 { font-size: 12px; font-weight: 700; margin-bottom: 10px; color: #333; }
+  .estilos-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .estilo img { width: 100%; height: 130px; object-fit: cover; border-radius: 8px; margin-bottom: 6px; }
+  .estilo h5 { font-size: 12px; font-weight: 700; margin-bottom: 2px; }
+  .estilo p { font-size: 11px; color: #666; }
+
+  /* Notas */
+  .notas { background: #fafafa; border: 1px solid #eee; border-radius: 6px; padding: 10px 14px; margin-bottom: 20px; font-size: 11px; color: #666; }
+  .notas span { font-weight: 600; color: #333; }
+
+  /* Totales */
+  .totales { border-top: 1px solid #eee; padding-top: 12px; }
+  .totales-row { display: flex; justify-content: space-between; font-size: 13px; padding: 4px 0; }
+  .totales-row.subtotal { color: #555; }
+  .totales-row.iva { color: #2d5a27; font-weight: 600; }
+  .totales-total { display: flex; justify-content: space-between; background: #1a3d16; color: white; padding: 14px 16px; border-radius: 8px; margin-top: 10px; font-size: 16px; font-weight: 800; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="brand">
+    <div class="logo-box">
+      <svg viewBox="0 0 24 24"><path d="M17 8C8 10 5.9 16.17 3.82 21H5.71C6.66 19.36 7.71 17.5 9 16c2 2 4 3 7 3-1-4-3-6-6-8 4 0 7.5 2 9 6 0-6-3-11-9-11-1.92 0-3.67.56-5.12 1.52C6.42 5.44 9.07 4 12 4c5 0 9 4 9 9h2c0-7.73-6.27-14-14-14C4.93 0 1.46 2.04 0 5.12L2.5 7.5C3.96 5.03 6.8 3.5 10 3.5c3.59 0 6.63 2 8.27 5.06L17 8z"/></svg>
+    </div>
+    <div class="brand-text">
+      <h1>GARDENS HUB</h1>
+      <p>Gardens Wood</p>
+    </div>
+  </div>
+  <div class="doc-info">
+    <h2>PRESUPUESTO</h2>
+    <p>{{FECHA}}</p>
+  </div>
+</div>
+
+<!-- Cliente -->
+<div class="client-bar">Cliente: <span>{{CLIENTE}}</span></div>
+
+<!-- Tabla de items -->
+<table>
+  <thead>
+    <tr>
+      <th>Descripción</th>
+      <th>Cant.</th>
+      <th>P. Unit.</th>
+      <th>Subtotal</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>
+        <div class="item-main">
+          <img class="item-img" src="{{IMG_CERCO}}" alt="cerco"/>
+          <div class="item-desc">
+            <h4>{{DESCRIPCION}}</h4>
+            <p>{{METROS}} metros lineales</p>
+          </div>
+        </div>
+      </td>
+      <td>{{METROS}} ml</td>
+      <td>{{PRECIO_UNIT_FMT}}</td>
+      <td>{{SUBTOTAL_FMT}}</td>
+    </tr>
+    {{FILA_DESCUENTO}}
+  </tbody>
+</table>
+
+<!-- Proceso de construcción -->
+<div class="proceso">
+  <h3>Proceso de Construcción de Cercos de Eucalipto</h3>
+  <div class="pasos">
+    <div class="paso">
+      <h4>Paso 1 — Cimentación de Hormigón</h4>
+      <img src="{{IMG_PASO1}}" alt="cimentacion"/>
+      <ul>
+        <li>Postes guía cada 2m con hormigón</li>
+        <li>Base sólida, no solo palos enterrados</li>
+        <li>Estabilidad ante vientos y humedad</li>
+      </ul>
+    </div>
+    <div class="paso">
+      <h4>Paso 2 — Refuerzo Estructural</h4>
+      <img src="{{IMG_PASO2}}" alt="refuerzo"/>
+      <ul>
+        <li>Tutores traseros que unifican la estructura</li>
+        <li>Garantizan durabilidad a largo plazo</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Estilos -->
+  <div class="estilos">
+    <h4>Resultado Final — Estilos Disponibles</h4>
+    <div class="estilos-grid">
+      <div class="estilo">
+        <img src="{{IMG_ESTILO_A}}" alt="estilo irregular"/>
+        <h5>Opción A: Estilo Irregular</h5>
+        <p>Terminación rústica y natural. Puntas a distintas alturas.</p>
+      </div>
+      <div class="estilo">
+        <img src="{{IMG_ESTILO_B}}" alt="estilo lineal"/>
+        <h5>Opción B: Estilo Lineal</h5>
+        <p>Terminación moderna y uniforme. Puntas al mismo nivel.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Notas -->
+<div class="notas"><span>Notas:</span> Materiales: madera tratada para exterior. Validez del presupuesto: 15 días.</div>
+
+<!-- Totales -->
+<div class="totales">
+  <div class="totales-row subtotal">
+    <span>Subtotal</span><span>{{SUBTOTAL_FMT}}</span>
+  </div>
+  <div class="totales-row iva">
+    <span>IVA 21%</span><span>{{IVA_TEXTO}}</span>
+  </div>
+  <div class="totales-total">
+    <span>TOTAL</span><span>{{TOTAL_FMT}}</span>
+  </div>
+</div>
+
+</body>
+</html>

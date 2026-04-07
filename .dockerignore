@@ -1,0 +1,13 @@
+.env
+.env.*
+node_modules
+.wwebjs_auth
+auth_info_baileys
+qr.png
+usuarios_vistos.json
+historial_consultas
+*.pdf
+*.xlsx
+.git
+.gitignore
+*.log

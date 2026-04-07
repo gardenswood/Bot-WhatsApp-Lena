@@ -21,6 +21,11 @@ steps:
       - '--region=us-central1'
       - '--platform=managed'
       - '--port=8080'
+      - '--min-instances=1'
+      - '--max-instances=1'
+      - '--no-cpu-throttling'
+      - '--timeout=3600'
+      - '--memory=1Gi'
       - '--no-allow-unauthenticated'
 
 images:

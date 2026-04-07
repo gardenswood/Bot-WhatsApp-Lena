@@ -10,9 +10,11 @@
     "deploy:dry": "node scripts/deploy.js --dry-run",
     "docs:pdf": "node scripts/generate-knowledge-pdfs.js",
     "verify": "node scripts/verify-flow.js",
+    "smoke:gemini": "node scripts/smoke-gemini-model.js",
     "labels:discover": "node scripts/discover-wa-labels.js",
     "geocode:clientes": "node scripts/geocodificar-clientes-direccion.js",
     "verify:cliente-agenda": "node scripts/verificar-cliente-agenda.js",
+    "wa:grupo-jid": "node scripts/whatsapp-grupo-jid.js",
     "seed:lid-mapeo": "node scripts/seed-lid-mapeo.js"
   },
   "dependencies": {

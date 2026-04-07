@@ -259,7 +259,7 @@ async function getConfigGeneral(opts) {
     const DEFAULT_CONFIG = {
         delayMinSeg: 26,
         delayMaxSeg: 34,
-        modeloGemini: 'gemini-2.5-flash',
+        modeloGemini: 'gemini-3.1-flash-lite-preview',
         frecuenciaAudioFidelizacion: 0,
         tiempoSilencioHumanoHoras: 24,
         botActivo: true,
@@ -477,7 +477,8 @@ async function getUltimosMensajesChatParaContexto(jid, limit = 12) {
         if (snap.empty) return '';
         const items = snap.docs.map((d) => d.data()).reverse();
         const lines = items.map((row) => {
-            const dir = row.direccion === 'saliente' ? 'Vicky' : 'Cliente';
+            // "U" = mensaje entrante; evita que el modelo use "Cliente" como nombre propio en saludos.
+            const dir = row.direccion === 'saliente' ? 'Vicky' : 'U';
             let ts = '';
             if (row.timestamp && typeof row.timestamp.toDate === 'function') {
                 ts = row.timestamp.toDate().toLocaleString('es-AR');

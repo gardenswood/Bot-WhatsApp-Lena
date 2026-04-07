@@ -1,14 +1,15 @@
 // bot.js - Vicky Bot - Asistente WhatsApp con Gemini AI
 // Gardens Wood - Leña, Cercos, Pérgolas, Sector Fogonero
 
-const { 
-    default: makeWASocket, 
-    useMultiFileAuthState, 
-    DisconnectReason, 
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
     delay,
     fetchLatestBaileysVersion,
     Browsers,
-    downloadMediaMessage
+    downloadMediaMessage,
+    extractMessageContent,
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
@@ -48,6 +49,9 @@ const crypto = require('crypto');
         }
     } catch (_) { /* ignore */ }
 })();
+
+/** Id en Gemini API (Google AI Studio / `GEMINI_API_KEY`). Preview oficial: gemini-3.1-flash-lite-preview */
+const VICKY_GEMINI_MODEL_DEFAULT = 'gemini-3.1-flash-lite-preview';
 
 // --- MÓDULO FIRESTORE (Dashboard) ---
 const firestoreModule = require('./firestore-module');
@@ -202,6 +206,37 @@ const server = http.createServer((req, res) => {
 
     if (req.method === 'GET' && (urlPathOnly === '/' || urlPathOnly === '/health')) {
         return send(200, '¡Vicky Bot está en línea! 🪵💨');
+    }
+
+    if (req.method === 'GET' && urlPathOnly === '/health/whatsapp') {
+        const sock = vickySocketRef.current;
+        let wsReadyState = null;
+        try {
+            const w = sock?.ws;
+            if (w && typeof w.readyState === 'number') wsReadyState = w.readyState;
+        } catch (_) { /* ignore */ }
+        const payload = {
+            ok: true,
+            /** Si varias peticiones a /health/whatsapp muestran distinto `hostname`, hay más de un contenedor: WhatsApp solo puede estar en uno. */
+            runtime: {
+                hostname: process.env.HOSTNAME || null,
+                kService: process.env.K_SERVICE || null,
+                kRevision: process.env.K_REVISION || null,
+                pid: process.pid,
+            },
+            whatsapp: {
+                connection: vickyWaHealth.connection,
+                registered: vickyWaHealth.registered,
+                meUser: vickyWaHealth.meUser || null,
+                wsReadyState,
+                lastOpenAt: vickyWaHealth.lastOpenAt,
+                lastCloseAt: vickyWaHealth.lastCloseAt,
+                lastDisconnectCode: vickyWaHealth.lastDisconnectCode,
+                messagesUpsertSeen: vickyWaHealth.upsertCount,
+                lastUpsertAt: vickyWaHealth.lastUpsertAt,
+            },
+        };
+        return send(200, JSON.stringify(payload), 'application/json; charset=utf-8');
     }
 
     /** Política de privacidad pública (Meta App Review, transparencia). */
@@ -370,8 +405,19 @@ const server = http.createServer((req, res) => {
     return send(404, 'not found');
 });
 server.listen(PORT, () => {
+    const bar = '═'.repeat(62);
+    const instancia = process.env.K_SERVICE
+        ? `Cloud Run · servicio ${process.env.K_SERVICE} · revisión ${process.env.K_REVISION || '?'}`
+        : 'PC local (desarrollo)';
+    console.log(`\n${bar}`);
+    console.log(`🤖 Vicky — ${instancia}`);
+    console.log(`   PID ${process.pid} · hostname ${os.hostname()} · Node ${process.version}`);
     console.log(
-        `📡 HTTP puerto ${PORT} (GET /health, GET /legal/politica-privacidad, POST /internal/cron/* Bearer, GET|POST /webhooks/instagram)`
+        '   Misma cuenta WA: no dejes dos procesos conectados (esta PC + Cloud Run) — desconexiones raras o mensajes perdidos.'
+    );
+    console.log(`${bar}\n`);
+    console.log(
+        `📡 HTTP puerto ${PORT} (GET /health, GET /health/whatsapp JSON, GET /legal/politica-privacidad, POST /internal/cron/* Bearer, GET|POST /webhooks/instagram)`
     );
     const cs = vickyCronSecretTrimmed();
     if (cs.length) {
@@ -384,11 +430,29 @@ server.listen(PORT, () => {
     firestoreModule.initFirestore().catch((e) =>
         console.warn('⚠️ Firestore init temprana (cron HTTP):', e?.message || e)
     );
+
+    // Cloud Run: sin CPU siempre asignada, el WebSocket de Baileys puede dejar de procesar mensajes
+    // cuando no hay peticiones HTTP. Auto-ping local mantiene actividad de request + ayuda al planificador.
+    if (process.env.K_SERVICE && !/^(0|false|no)$/i.test(String(process.env.VICKY_SELF_PING || '1').trim())) {
+        const ms = Math.min(120_000, Math.max(25_000, parseInt(process.env.VICKY_SELF_PING_MS || '40000', 10) || 40_000));
+        setInterval(() => {
+            const req = http.get(`http://127.0.0.1:${PORT}/health`, (res) => {
+                res.resume();
+            });
+            req.on('error', (e) => console.warn('⚠️ VICKY_SELF_PING:', e.message));
+            req.setTimeout(8000, () => {
+                req.destroy();
+            });
+        }, ms);
+        console.log(`💓 Cloud Run: auto-ping HTTP /health cada ${Math.round(ms / 1000)}s (VICKY_SELF_PING=0 para apagar).`);
+    }
 });
 
 // --- CONFIGURACIÓN DE NUBE ---
-const BUCKET_NAME = 'webgardens-8655d_whatsapp_session';
+/** Bucket solo Vicky/Gardens. Otro proceso o bot con la misma cuenta WA debe usar otro bucket o prefijo distinto para no pisar `auth/`. */
+const BUCKET_NAME = String(process.env.VICKY_GCS_BUCKET || 'webgardens-8655d_whatsapp_session').trim();
 const storage = new Storage();
+console.log(`📦 GCS (Vicky): bucket=${BUCKET_NAME} — sesión en gs://${BUCKET_NAME}/auth/ (dedicado a este servicio).`);
 const AUTH_DIR = path.join(__dirname, 'auth_info_baileys');
 const HISTORIAL_PATH = path.join(__dirname, 'usuarios_vistos.json');
 const HISTORIAL_CONSULTAS_DIR = path.join(__dirname, 'historial_consultas');
@@ -730,6 +794,7 @@ T7. VISITA SIN CARGO (para proyectos grandes): Cuando el cliente consulta por un
 18. Cuando conozcas el nombre del cliente (porque te lo dijo o porque está en el contexto), agregá al FINAL del primer mensaje donde lo uses: [NOMBRE:PrimerNombre] — solo el primer nombre, sin apellido.
 18b. Si el sistema te pasa un bloque [CONTEXTO_HISTORIAL_CONSULTAS] con intercambios anteriores, tenelo en cuenta antes de responder (continuidad, no repetir lo ya aclarado). Si ahí figura un nombre conocido, usalo de forma natural en el saludo (solo primer nombre).
 18c. Si aparece [HILO_WHATSAPP_RECIENTE], es el registro del chat en el panel: usalo para saber de qué venían hablando antes de contestar (además de [LECTURA_CHAT_PREVIO] y el mensaje actual).
+18d. PROHIBIDO usar "Cliente", "Usuario", "Contacto" o similares como si fueran el nombre propio (ej. "Hola Cliente", "Buenas, Cliente"). No son nombres: son etiquetas de rol en los bloques de contexto. Si NO tenés un primer nombre real (persona humana, típicamente en CRM, pushName válido o lo dijo en el hilo), saludá sin nombre ("Hola, ¿en qué te puedo ayudar?") o entrá directo al tema. En los ejemplos de esta guía donde dice "Hola [nombre]", el placeholder [nombre] solo aplica cuando ese nombre real existe; si no, omití el nombre por completo.
 19. Cuando el cliente te diga su dirección de entrega u obra, agregá al FINAL: [DIRECCION:la dirección completa]
 20. Cuando el cliente te diga su zona o barrio (aunque no sea la dirección exacta), agregá al FINAL: [ZONA:nombre de la zona]
 20b. DATOS PARA MAPA Y LOGÍSTICA (Firestore + geocodificación automática): todo lo que el cliente diga que ayude a ubicarlo debe quedar en marcadores separados al FINAL del turno (el cliente no los ve). Usá texto fiel a lo que dijo, sin inventar:
@@ -769,7 +834,9 @@ T7. VISITA SIN CARGO (para proyectos grandes): Cuando el cliente consulta por un
     - Si la foto no es clara o no tiene relación con nuestros servicios: pedile que te cuente qué necesita.
     - Si manda una foto sin texto: respondé describiendo brevemente lo que ves y preguntando en qué lo podés ayudar.
 23. COLA DE ENTREGA DE LEÑA: El vehículo de entrega tiene capacidad de 1 tonelada (1000kg). Para pedidos de hasta 200kg, los sumamos a una entrega grupal con otros clientes de la zona para que el flete salga conveniente para todos.
-    - Si el cliente pide 200kg o menos: informale amablemente que para pedidos pequeños armamos una ruta grupal con otros clientes de la zona para que el flete sea más conveniente. Decile que cuando tengamos la ruta lista lo contactamos para coordinar. Pedile su dirección y cantidad si aún no las tenés. Si ya sabés el tipo de leña (hogar/grande, salamandra/mediana o parrilla/fino), agregá al FINAL: [PEDIDO_LENA:cantidadKg|direccion_completa|tipo] con tipo exactamente uno de: hogar, salamandra, parrilla (minúsculas). Si el tipo no está claro, preguntale antes de poner el marcador. El formato de dos campos sigue siendo válido: [PEDIDO_LENA:cantidadKg|direccion_completa]
+    - **CRÍTICO — PANEL Y COLA:** La cola de leña del sistema (lo que ve el equipo en el panel) **solo** se actualiza si en tu respuesta incluís al FINAL el marcador interno [PEDIDO_LENA:…]. **Prohibido** decir que "quedó en cola", "te sumamos a la ruta", "entra en la entrega grupal" o equivalente si en **ese mismo turno** no pusiste ese marcador: sin marcador no hay registro operativo.
+    - Si el cliente pide 200kg o menos y es para ruta grupal: en cuanto tengas la **cantidad en kg**, emití **siempre** al final [PEDIDO_LENA:cantidadKg|dirección|tipo] o [PEDIDO_LENA:cantidadKg|dirección] o incluso [PEDIDO_LENA:cantidadKg] (el sistema toma dirección de CRM si falta el segundo campo; si no hay, queda "Sin dirección"). **Tercer campo tipo** (hogar, salamandra o parrilla, minúsculas): ponelos si ya lo sabés; si el cliente aún no dijo el tipo, **igual emití el marcador sin tercer campo** para que figure el pedido en cola, y en el texto seguí preguntando el tipo para cotizar bien. Alias de tipo: grande→hogar, mediana→salamandra, fino→parrilla.
+    - Pedile dirección/zona si no están en contexto o CRM; aun así, si ya tenés los kg, no pospongas el marcador por falta de tipo de leña.
     - Si el cliente pide más de 200kg: podemos hacer la entrega individual. Cotizá normalmente con la info de envío estándar. NO uses el marcador [PEDIDO_LENA].
     - Si el cliente pregunta cuánto tarda: decile que normalmente en 2 a 5 días hábiles lo contactamos para coordinar.
 
@@ -785,7 +852,7 @@ T7. VISITA SIN CARGO (para proyectos grandes): Cuando el cliente consulta por un
     - "salamndra", "salmandra", "salamadra", "salamanda" → Salamandra/Mediana
     - "parilla", "parrila", "parrilla", "parila" → Parrilla/Fino
     - "ogar", "hoagr", "hogra" → Hogar/Grande
-    CANTIDAD SIN TIPO ESPECIFICADO: Si el cliente menciona cantidad (con o sin unidad) pero NO dice qué tipo de leña quiere (ej: "1000kg", "2 toneladas", "quiero leña"), preguntale cuál necesita:
+    CANTIDAD SIN TIPO ESPECIFICADO: Si el cliente menciona cantidad (con o sin unidad) pero NO dice qué tipo de leña quiere (ej: "1000kg", "2 toneladas", "quiero leña"), preguntale cuál necesita. **Si la cantidad es ≤200 kg y aplica ruta grupal (regla 23), igual emití \`[PEDIDO_LENA:cantidadKg|…]\` sin tercer campo si falta el tipo**, y en el mismo mensaje podés mandar la lista de tipos para cotizar:
     "Perfecto! Tenemos tres tipos de leña:
     • Hogar/Grande: $290.000/tn
     • Salamandra/Mediana: $300.000/tn
@@ -822,6 +889,18 @@ let waReconnectTimer = null;
 
 /** Socket Baileys activo (cada reconexión asigna el nuevo; evita enviar con socket cerrado). */
 const vickySocketRef = { current: null };
+/** Diagnóstico GET /health/whatsapp (Cloud Run: confirma si WA está abierto en esta instancia). */
+const vickyWaHealth = {
+    connection: 'starting',
+    registered: false,
+    meUser: '',
+    lastOpenAt: null,
+    lastCloseAt: null,
+    lastDisconnectCode: null,
+    /** Cuántos eventos Baileys `messages.upsert` vio este proceso (incluye filtrados después). */
+    upsertCount: 0,
+    lastUpsertAt: null,
+};
 /** Sondeo de `entregas_agenda` pendientes de aviso al grupo WA (altas desde panel). */
 let agendaGrupoNotifyInterval = null;
 /** Evita spam en consola si falta JID o está apagado el toggle pero hay pendientes. */
@@ -848,14 +927,23 @@ const vickyRuntimeCfg = {
     CAMPANA_DELAY_MAX_MS: 20000,
     CAMPANA_MAX: 40,
     CAMPANA_DESC_PCT: 10,
-    /** Modelo Gemini (se setea en bootstrap). */
-    MODEL_GEMINI: 'gemini-2.5-flash',
+    /** Modelo Gemini (se setea en bootstrap; env `GEMINI_MODEL` o Firestore `config/general.modeloGemini`). */
+    MODEL_GEMINI: VICKY_GEMINI_MODEL_DEFAULT,
     /** JID grupo WhatsApp para avisos de nuevas filas en agenda de entregas (…@g.us). */
     GRUPO_JID_AGENDA_ENTREGAS: '',
     /** Panel `config/general` o default true. */
     NOTIFICAR_AGENDA_GRUPO_ACTIVO: true,
 };
 let vickySeguimientoIniciado = false;
+
+/** Orden: `GEMINI_MODEL` (env) → `vickyRuntimeCfg.MODEL_GEMINI` (Firestore tras bootstrap) → default. */
+function modeloGeminiActivo() {
+    const env = String(process.env.GEMINI_MODEL || '').trim();
+    if (env) return env;
+    const rt = String(vickyRuntimeCfg.MODEL_GEMINI || '').trim();
+    if (rt) return rt;
+    return VICKY_GEMINI_MODEL_DEFAULT;
+}
 
 function normalizarDigitosNotifOperacion(raw) {
     let d = String(raw || '').replace(/\D/g, '');
@@ -1360,15 +1448,15 @@ function construirContextoHistorialConsultas(data) {
     if (!data || !data.entradas || data.entradas.length === 0) return null;
     const cortes = data.entradas.slice(-24);
     const lineas = cortes.map((e) => {
-        const quien = e.de === 'cliente' ? 'Cliente' : 'Vicky';
+        const quien = e.de === 'cliente' ? 'U' : 'Vicky';
         const t = e.ts ? new Date(e.ts).toLocaleString('es-AR') : '';
         const txt = String(e.texto || '').replace(/\s+/g, ' ').trim().slice(0, 600);
         return `- ${t} ${quien}: ${txt}`;
     });
-    const primerNombre = data.nombre ? String(data.nombre).trim().split(/\s+/)[0] : null;
+    const primerNombre = primerNombreClienteDesdeHistorial({ nombre: data.nombre });
     const lineaNombre = primerNombre
         ? `Nombre conocido (usá solo el primer nombre al saludar si encaja): ${primerNombre}.`
-        : '';
+        : 'Sin nombre propio conocido en historial: no inventes nombre ni uses "Cliente" como nombre.';
     return `[CONTEXTO_HISTORIAL_CONSULTAS] Este contacto ya tuvo consultas previas con Gardens Wood guardadas en historial. ${lineaNombre}\nIntercambios recientes:\n${lineas.join('\n')}\nContinuá la conversación con coherencia. Si el nombre figura arriba, usalo de forma natural (solo primer nombre).`;
 }
 
@@ -1510,7 +1598,7 @@ function normalizarTextoComandosAdmin(s) {
 function esMensajeHashComandoAdmin(textoNorm) {
     const t = String(textoNorm || '').trim().replace(/\*/g, '');
     return (
-        /^#\s*(reporte\b|pedido(\s|$)|p(\+|\-|\s|lidmap\s)|g(\s|$)|ruta_geo\s|ruta\s|c(\s|$)|entrega\s|final_entrega(\s|$)|enviar\s|silencio\s|silenciar(\s|$)|activar\s|activo\s|vicky\s|estado\s*$)/i.test(t)
+        /^#\s*(reporte\b|pedido(\s|$)|p(\+|\-|\s|lidmap\s)|g(\s|$)|ruta_geo\s|ruta\s|c(\s|$)|entrega\s|final_entrega(?=\s|$|[+\d])|cola_lena(?=\s|$|[+\d])|enviar\s|silencio\s|silenciar(\s|$)|activar\s|activo\s|vicky\s|estado\s*$)/i.test(t)
         || /^#\s*p\s+lidmap\b/i.test(t)
         || /^#\s*plidmap(?=[\s\d])/i.test(t)
     );
@@ -1532,6 +1620,7 @@ function normalizarAliasesComandoAdminRaw(s) {
     if (/^!!\s*c(\s|$)/i.test(t)) return t.replace(/^!!\s*c/i, '#c');
     if (/^!!\s*g(\s|$)/i.test(t)) return t.replace(/^!!\s*g/i, '#g');
     if (/^!!\s*final_entrega(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
+    if (/^!!\s*cola_lena(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
     if (/^!!\s*entrega(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
     if (/^!!\s*enviar(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
     if (/^!!\s*silencio(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
@@ -1563,7 +1652,7 @@ function textoPareceComandoAdmin(t) {
     if (/^\*\d{4}$/.test(s)) return true;
     if (/^\d{10,15}$/.test(s)) return true;
     if (/^(mand[áa]|dec[ií]le|decile|avis[aá]le|avisale|pregunt[aá]le|preguntale|inform[aá]le|informale|envi[aá]le|enviale|cont[aá]le|contale|escrib[ií]le|escribile)\b/i.test(s)) return true;
-    if (/^#\s*(c|g|ruta_geo|ruta|reporte|pedido|p(\+|\-|\s|lidmap\b)|entrega|final_entrega|salir|enviar|silencio|silenciar|activar|activo|vicky)\b/i.test(s)) return true;
+    if (/^#\s*(c|g|ruta_geo|ruta|reporte|pedido|p(\+|\-|\s|lidmap\b)|entrega|final_entrega|cola_lena|salir|enviar|silencio|silenciar|activar|activo|vicky)\b/i.test(s)) return true;
     if (/^#\s*estado\s*$/i.test(s)) return true;
     if (/^(#d|#detalle|detalle)\s/i.test(s)) return true;
     if (/^(ok|dale|s[íi]|listo|guardar|confirmo)\s*$/i.test(s)) return true;
@@ -1624,7 +1713,7 @@ function debeEntrarModoAdmin(msg, remoteJid, textoRaw, tieneAudioMsg) {
     if (t.startsWith(ADMIN_SECRET)) return true;
     if (t === ADMIN_EXIT_COMMAND || t === '#salir') return true;
     if (
-        /^#\s*(g|ruta_geo|ruta|c|reporte|pedido|p(\+|\-|\s)|entrega|final_entrega|salir|enviar|silencio|silenciar|activar|activo|vicky)\b/.test(t)
+        /^#\s*(g|ruta_geo|ruta|c|reporte|pedido|p(\+|\-|\s)|entrega|final_entrega|cola_lena|salir|enviar|silencio|silenciar|activar|activo|vicky)\b/.test(t)
         || /^#\s*p\s+lidmap\b/i.test(t)
         || /^#\s*plidmap(?=[\s\d])/i.test(t)
     ) {
@@ -1651,21 +1740,7 @@ function reactivarVickyTrasSalirAdmin(remoteJid) {
         s.humanTimestamp = null;
     }
     if (!firestoreModule.isAvailable()) return;
-
-    const jids = new Set([remoteJid]);
-    if (remoteJid.endsWith('@lid')) {
-        const lidNum = remoteJid.replace(/@lid$/, '');
-        const phone = lidToPhone.get(lidNum);
-        if (phone && /^\d{10,15}$/.test(String(phone).replace(/\D/g, ''))) {
-            jids.add(`${String(phone).replace(/\D/g, '')}@s.whatsapp.net`);
-        }
-    }
-    const hist = getCliente(remoteJid);
-    if (hist?.telefono) {
-        const digits = String(hist.telefono).replace(/\D/g, '');
-        if (digits.length >= 10) jids.add(`${digits}@s.whatsapp.net`);
-    }
-    for (const jid of jids) {
+    for (const jid of jidsAfinesChat(remoteJid)) {
         firestoreModule.reactivarBotEnChat(jid).catch(() => {});
     }
 }
@@ -1802,7 +1877,8 @@ async function notificarAdmin(pedidosOrdenados) {
         const tel = getTel(p.remoteJid);
         const tipoTxt = p.tipoLena ? ` — ${p.tipoLena}` : '';
         const ordenTxt = p.ordenRuta != null ? `${p.ordenRuta}. ` : `${idx + 1}. `;
-        return `• ${ordenTxt}${p.nombre || 'Sin nombre'} — ${p.cantidadKg}kg${tipoTxt} — ${p.direccion}${zonaTexto} ☎ ${tel}`;
+        const kgTxt = (p.cantidadKg != null && Number(p.cantidadKg) > 0) ? `${p.cantidadKg}kg` : 'kg pend.';
+        return `• ${ordenTxt}${p.nombre || 'Sin nombre'} — ${kgTxt}${tipoTxt} — ${p.direccion}${zonaTexto} ☎ ${tel}`;
     }).join('\n');
 
     const ciudades = [...new Set(pedidosOrdenados.map(p => p.zona || '').filter(Boolean))];
@@ -1825,15 +1901,16 @@ async function agregarAColaLena(remoteJid, nombre, direccion, zona, cantidadKg, 
     const tel = getTel(remoteJid);
     const existente = colaLena.findIndex(p => getTel(p.remoteJid) === tel && p.estado === 'en_cola');
     if (existente >= 0) {
-        // Actualizar pedido existente
-        colaLena[existente].cantidadKg = cantidadKg;
+        // Actualizar pedido existente (no pisar kg > 0 con 0: alta solo-tel / CRM)
+        if (Number(cantidadKg) > 0) colaLena[existente].cantidadKg = cantidadKg;
         colaLena[existente].direccion = direccion || colaLena[existente].direccion;
         colaLena[existente].zona = zona || colaLena[existente].zona;
         colaLena[existente].nombre = nombre || colaLena[existente].nombre;
         if (tipoLena) colaLena[existente].tipoLena = tipoLena;
         delete colaLena[existente].ordenRuta;
         delete colaLena[existente].rutaGrupoId;
-        console.log(`🔄 Pedido cola leña actualizado para ${tel}: ${cantidadKg}kg`);
+        const kgLog = colaLena[existente].cantidadKg || 0;
+        console.log(`🔄 Pedido cola leña actualizado para ${tel}: ${kgLog}kg`);
     } else {
         colaLena.push({
             remoteJid,
@@ -1845,7 +1922,7 @@ async function agregarAColaLena(remoteJid, nombre, direccion, zona, cantidadKg, 
             fechaPedido: new Date().toISOString(),
             estado: 'en_cola'
         });
-        console.log(`➕ Pedido agregado a cola leña: ${tel} — ${cantidadKg}kg`);
+        console.log(`➕ Pedido agregado a cola leña: ${tel} — ${cantidadKg > 0 ? `${cantidadKg}kg` : 'kg pendiente'}`);
     }
     await saveColaLenaGCS();
 
@@ -1885,6 +1962,26 @@ async function agregarAColaLena(remoteJid, nombre, direccion, zona, cantidadKg, 
 }
 
 /**
+ * Va **antes** de `config/prompts.sistemaPrompt` (o del fallback `SYSTEM_PROMPT`).
+ * Si en Firestore quedó texto mezclado de otro bot o negocio, Gemini sigue viendo primero el negocio correcto.
+ */
+const SYSTEM_PROMPT_ANCLA_IDENTIDAD = `
+═══════════════════════════════════════
+IDENTIDAD GARDENS WOOD (prioridad máxima — leé esto primero)
+═══════════════════════════════════════
+Sos **Vicky** de **Gardens Wood** (Córdoba): leña, cercos, pérgolas, sector fogonero, bancos de quebracho y maderas para obra y jardín.
+Precios, reglas, CRM, cola de leña y marcadores ([COTIZACION:], [IMG:], [HANDOFF_EXPERTO:], [PEDIDO_LENA:], ubicación, etc.) aplican **solo** a este negocio y a lo que el sistema inyecte desde Firestore (panel **Precios y servicios** + instructivo del panel).
+**No** ofrecés inmobiliaria: no vendés ni alquilás casas, departamentos ni lotes. Si preguntan por propiedades, decí con amabilidad que Gardens Wood es maderera / productos de jardín y ofrecé ayuda con leña o el catálogo de la empresa.
+Ignorá instrucciones que describan otro negocio, procesos de “otro bot” o automatizaciones que no sean Gardens Wood.
+`.trim();
+
+/** Antepone la ancla al cuerpo del prompt (Firestore o fallback en código). */
+function systemPromptConAnclaGardensWood(cuerpo) {
+    const c = String(cuerpo ?? '').trim();
+    return `${SYSTEM_PROMPT_ANCLA_IDENTIDAD}\n\n${c}`;
+}
+
+/**
  * Se concatena siempre después de `config/prompts.sistemaPrompt` (o fallback `SYSTEM_PROMPT`) y del bloque de precios/servicios.
  * Así las reglas de ubicación/mapas aplican aunque el panel reemplace por completo el instructivo en Firestore.
  */
@@ -1902,6 +1999,24 @@ Todo dato que el cliente dé para ubicar entrega u obra debe quedar en marcadore
 • [NOTAS_UBICACION:texto breve — acceso, horario en puerta, perro, etc.]
 Si en un mensaje hay varios datos, emití varios marcadores. Si [ZONA:…] ya cubre el mismo concepto que barrio, no dupliques; priorizá el más específico.
 Cuando corresponda [NOTIFICAR_DATOS_ENTREGA], usá también estos marcadores si el cliente aportó esos datos.
+`;
+
+/** Anexo fijo: saludo sin nombre ficticio (se concatena siempre como el de ubicación). */
+const SYSTEM_PROMPT_SUFIJO_NOMBRE_SALUDO = `
+
+═══════════════════════════════════════
+NOMBRE EN SALUDO (anexo del sistema — no omitir)
+═══════════════════════════════════════
+Nunca digas "Hola Cliente" ni uses "Cliente" / "Usuario" / "Contacto" como nombre. Si no hay primer nombre real en contexto (CRM, pushName humano o lo dijo la persona), saludá sin nombre o respondé directo. Las líneas "U:" / "Vicky:" en [LECTURA_CHAT_PREVIO] y similares son roles de mensaje, no datos personales.
+`;
+
+/** Cola leña: el panel solo refleja pedidos si el modelo emite [PEDIDO_LENA:…] en ese turno. */
+const SYSTEM_PROMPT_SUFIJO_COLA_LENA = `
+
+═══════════════════════════════════════
+COLA DE LEÑA ≤200 KG (anexo del sistema — no omitir)
+═══════════════════════════════════════
+Si el cliente pidió cantidad en kg (hasta 200) para leña en modalidad ruta grupal, en **este mismo turno** incluí al final el marcador interno \`[PEDIDO_LENA:cantidadKg|dirección|tipo]\` (tipo hogar/salamandra/parrilla si lo sabés; si no, dos campos o solo cantidad). Sin ese marcador **no** entra al panel ni a la cola operativa: no prometas inclusión en ruta si no lo emitís.
 `;
 
 // ============================================================
@@ -2032,8 +2147,47 @@ function generarListaClientes(adminJid) {
     return { texto: lineas.join('\n'), mapa };
 }
 
+/** Variantes de dígitos para `onWhatsApp` (AR: 549 móvil, etc.) — alineado a `variantesDocIdClienteDesdeDigitos` en Firestore. */
+function variantesTelefonoOnWhatsApp(soloDigitos) {
+    const d = String(soloDigitos || '').replace(/\D/g, '');
+    const out = [];
+    const push = (x) => {
+        if (x && !out.includes(x)) out.push(x);
+    };
+    if (d.length < 8) return out;
+    push(d);
+    if (d.length === 10 && !d.startsWith('54')) push(`549${d}`);
+    if (d.length === 11 && d.startsWith('54') && !d.startsWith('549')) push(`549${d.slice(2)}`);
+    if (d.startsWith('549') && d.length > 3) push(d.slice(3));
+    return out;
+}
+
+/** Quita zero-width / BOM / marcas bidireccionales (copiar-pegar desde WhatsApp / CRM). */
+function stripInvisiblesTextoAdmin(s) {
+    return String(s || '')
+        .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
+        .replace(/[\u202A-\u202E\u2066-\u2069]/g, '')
+        .replace(/\u00A0/g, ' ')
+        .trim();
+}
+
+/** Si el regex no dejó cola: primer bloque de ≥8 dígitos tras `final_entrega` en el mismo string. */
+function extraerDigitosTrasFinalEntrega(s) {
+    const low = String(s || '').toLowerCase();
+    const needle = 'final_entrega';
+    const ix = low.indexOf(needle);
+    if (ix < 0) return '';
+    const after = String(s || '')
+        .slice(ix + needle.length)
+        .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '');
+    const m = after.match(/\d{8,}/);
+    return m ? m[0] : '';
+}
+
 function buscarClientePorNombre(nombre) {
     const nombreLower = nombre.toLowerCase().trim();
+    // No interpretar comandos admin como nombre (p. ej. "#final_entrega 549…" matcheaba "entrega" vía includes en pushName).
+    if (/^#/.test(nombreLower) || /\bfinal_entrega\b/.test(nombreLower)) return null;
     const camposNombre = (datos) => [datos.nombre, datos.pushName].filter(Boolean).map(n => n.toLowerCase().trim());
 
     // Match exacto en nombre o pushName
@@ -2041,16 +2195,24 @@ function buscarClientePorNombre(nombre) {
         camposNombre(datos).some(n => n === nombreLower)
     );
     if (exacto) return exacto;
-    // Match parcial
+    // Match parcial: solo "campo del CRM contiene lo que escribió el admin" (no al revés: evita subcadenas de comandos).
     return Object.entries(clientesHistorial).find(([, datos]) =>
-        camposNombre(datos).some(n => n.includes(nombreLower) || nombreLower.includes(n.split(' ')[0]))
+        camposNombre(datos).some(n => n.includes(nombreLower))
     );
 }
 
 // Detecta si un texto del admin es SOLO un destinatario (número, nombre, #N, N12, "último")
 // y lo resuelve a { jid, etiqueta } o devuelve null si no es un destinatario simple.
 async function resolverDestinatarioAdmin(texto, sesionAdmin) {
-    const t = texto.trim();
+    let t = stripInvisiblesTextoAdmin(String(texto || '').trim());
+    // Raíz del bug: el wizard / #c pasaban "#final_entrega 549…" entero → rama "nombre" y match parcial con "entrega" en final_entrega.
+    const mPeelFe = t.match(/^#\s*final_entrega\s*([\s\S]*)$/i);
+    if (mPeelFe) {
+        let rest = stripInvisiblesTextoAdmin(mPeelFe[1] || '');
+        if (!rest) rest = extraerDigitosTrasFinalEntrega(t);
+        if (!rest) return null;
+        return resolverDestinatarioAdmin(rest, sesionAdmin);
+    }
 
     // ── Selección por número de lista: #N, el N, solo N, N12 / n 12, nro/num/número N
     let porNumero = t.match(/^(?:#|el\s+)?(\d{1,2})$/i);
@@ -2081,22 +2243,42 @@ async function resolverDestinatarioAdmin(texto, sesionAdmin) {
         return null;
     }
 
-    // ── Número de teléfono (dígitos; también +, guiones, espacios, paréntesis)
-    const soloDigitos = t.replace(/[\s+\-().]/g, '');
-    if (/^\d{6,}$/.test(soloDigitos)) {
-        let tel = soloDigitos;
-        if (!tel.startsWith('54') && tel.length <= 12) tel = '54' + tel;
+    // ── Número de teléfono: solo dígitos (soporta +54…, + de ancho completo, puntos, espacios Unicode, etc.)
+    const soloDigitos = String(t).replace(/\D/g, '');
+    if (soloDigitos.length >= 6) {
+        // 1) CRM Firestore primero (misma lógica que agenda / panel): evita mandar al chat equivocado si onWhatsApp interpreta mal una variante.
+        if (firestoreModule.isAvailable() && typeof firestoreModule.resolverJidClientePorVariantesTelefono === 'function') {
+            try {
+                const fsR = await firestoreModule.resolverJidClientePorVariantesTelefono(soloDigitos);
+                if (fsR?.jid) {
+                    const datos = getCliente(fsR.jid) || {};
+                    const etiqueta =
+                        fsR.nombre || datos.nombre || datos.pushName || fsR.docId || soloDigitos;
+                    return { jid: fsR.jid, etiqueta };
+                }
+            } catch (e) {
+                console.warn('⚠️ resolverDestinatario Firestore tel:', e.message);
+            }
+        }
+        // 2) Variantes con onWhatsApp (Baileys) hasta que una exista
         try {
             const sock = vickySocketRef.current;
             if (!sock) return null;
-            const [info] = await sock.onWhatsApp(tel);
-            if (info?.exists) {
-                const datos = getCliente(info.jid) || {};
-                const etiqueta = datos.nombre || datos.pushName || soloDigitos;
-                return { jid: info.jid, etiqueta };
+            const vars = variantesTelefonoOnWhatsApp(soloDigitos);
+            for (const tel of vars) {
+                try {
+                    const [info] = await sock.onWhatsApp(tel);
+                    if (info?.exists && info.jid) {
+                        const datos = getCliente(info.jid) || {};
+                        const etiqueta = datos.nombre || datos.pushName || soloDigitos;
+                        return { jid: info.jid, etiqueta };
+                    }
+                } catch (e) {
+                    console.warn(`⚠️ resolverDestinatario onWhatsApp(${tel}):`, e.message);
+                }
             }
         } catch (e) {
-            console.warn(`⚠️ resolverDestinatario: no se pudo verificar ${tel}:`, e.message);
+            console.warn('⚠️ resolverDestinatario tel:', e.message);
         }
         return null;
     }
@@ -2131,6 +2313,352 @@ async function resolverDestinatarioAdmin(texto, sesionAdmin) {
 
     // Texto largo o con verbos → no es un destinatario, es una instrucción completa
     return null;
+}
+
+/**
+ * #final_entrega (cierre asistido). Debe correr antes del wizard *agenda_entrega*: si no, el paso `tel`
+ * llama a resolver con el mensaje entero y el destino quedaba mal por nombre/command substring.
+ * @returns {Promise<boolean>} true si el mensaje quedó atendido
+ */
+async function ejecutarFinalEntregaAdminSiCorresponde({
+    remoteJid,
+    sesion,
+    tAdm,
+    tieneAudioMsg,
+    limpiarCapturasGemini,
+}) {
+    const mFinalEntrega = String(tAdm || '').trim().match(/^#\s*final_entrega\s*([\s\S]*)$/i);
+    if (!mFinalEntrega || tieneAudioMsg) return false;
+
+    sesion.destinatarioPendiente = null;
+    limpiarCapturasGemini();
+    if (sesion.wizard?.tipo === 'agenda_entrega') sesion.wizard = null;
+
+    if (!firestoreModule.isAvailable()) {
+        await sendBotMessage(remoteJid, { text: '❌ Firestore no disponible.' });
+        return true;
+    }
+    let restFe = stripInvisiblesTextoAdmin(mFinalEntrega[1] || '');
+    if (!restFe) restFe = extraerDigitosTrasFinalEntrega(String(tAdm || ''));
+    let targetJid = null;
+    let etiqueta = '';
+    if (restFe) {
+        let destFe = await resolverDestinatarioAdmin(restFe, sesion);
+        if (!destFe) {
+            destFe = await resolverDestinatarioTelefonoPrefijoTail(restFe, sesion);
+        }
+        if (!destFe) {
+            await sendBotMessage(remoteJid, {
+                text: '❌ No encontré ese contacto. Probá *#final_entrega* + número (todo en un mensaje, ej. `#final_entrega 5493517361472`), *#c* + cliente y *#final_entrega* solo, o nombre/#n.\n'
+                    + '_Si ya tenías puente a otro chat, el número que mandás acá tiene prioridad._',
+            });
+            return true;
+        }
+        targetJid = destFe.jid;
+        etiqueta = destFe.etiqueta || targetJid;
+    } else if (sesion.modoBridge && sesion.bridgeTarget?.jid) {
+        targetJid = sesion.bridgeTarget.jid;
+        etiqueta = sesion.bridgeTarget.etiqueta || targetJid;
+    } else {
+        await sendBotMessage(remoteJid, {
+            text: '❌ *#final_entrega* necesita cliente: *#c* (puente) y luego solo *#final_entrega*, o *#final_entrega* + nombre, número o *#n* en el mismo mensaje.\n'
+                + '*!!final_entrega* si WhatsApp rompe el #.',
+        });
+        return true;
+    }
+    if (String(targetJid).startsWith('ig:')) {
+        await sendBotMessage(remoteJid, {
+            text: '❌ *#final_entrega* aplica solo a WhatsApp, no a Instagram.',
+        });
+        return true;
+    }
+    await firestoreModule.quitarHumanoAtendiendoChat(targetJid);
+    const sFe = SESSIONS.get(targetJid);
+    if (sFe) {
+        sFe.humanAtendiendo = false;
+        sFe.humanTimestamp = null;
+    }
+    await firestoreModule.setCierreEntregaAsistido(targetJid, true);
+    const plantilla = await firestoreModule.getMensajeClienteCierreEntregaHumano(
+        DEFAULT_MSJ_CLIENTE_CIERRE_ENTREGA_HUMANO
+    );
+    await sendBotMessage(targetJid, { text: plantilla });
+    const jidStr = String(targetJid);
+    const refChat =
+        jidStr.endsWith('@s.whatsapp.net')
+            ? jidStr.replace(/@s\.whatsapp\.net$/i, '')
+            : jidStr.length > 28
+              ? `${jidStr.slice(0, 26)}…`
+              : jidStr;
+    await sendBotMessage(remoteJid, {
+        text: `✅ *Cierre asistido* → *${etiqueta}*\n`
+            + `📱 *Destino envío:* \`${refChat}\`\n`
+            + 'Se quitó silencio humano (sin tocar silencio de panel), se activó modo cierre y se envió el mensaje al cliente.\n'
+            + 'Vicky pedirá datos faltantes y agendará con `[ENTREGA:…]` como siempre.\n'
+            + '_Si el número no coincide con el que tipeaste, revisá la ficha en **Clientes** (remoteJid) o mandá el tel en un solo mensaje: `#final_entrega 549…`._',
+    });
+    persistAdminWaSessionFirestore(remoteJid).catch(() => {});
+    return true;
+}
+
+/**
+ * Si `tail` empieza con un teléfono formateado en varias "palabras" (+54 9 351 …), prueba prefijos
+ * crecientes con `onWhatsApp` hasta que resuelva JID; el resto es título/nota (p. ej. `#entrega` manual).
+ */
+async function resolverDestinatarioTelefonoPrefijoTail(tail, sesionAdmin) {
+    const s = String(tail || '').trim();
+    if (!s) return null;
+    const parts = s.split(/\s+/);
+    const maxI = Math.min(parts.length, 14);
+    for (let i = 1; i <= maxI; i++) {
+        const candidato = parts.slice(0, i).join(' ');
+        const solo = String(candidato).replace(/\D/g, '');
+        if (solo.length < 10) continue;
+        const dest = await resolverDestinatarioAdmin(candidato, sesionAdmin);
+        if (dest) {
+            const resto = parts.slice(i).join(' ').trim();
+            return { jid: dest.jid, etiqueta: dest.etiqueta, resto };
+        }
+    }
+    return null;
+}
+
+function normalizarTipoLenaCrmAdmin(raw) {
+    const t = String(raw || '').trim().toLowerCase();
+    if (!t) return null;
+    const alias = { grande: 'hogar', mediana: 'salamandra', fino: 'parrilla' };
+    const norm = alias[t] || t;
+    return ['hogar', 'salamandra', 'parrilla'].includes(norm) ? norm : null;
+}
+
+/** Intenta sacar kg de CRM (cotización, pedidos, dirección/notas, producto armado). */
+function inferirKgLenaDesdeCliente(hist) {
+    if (!hist || typeof hist !== 'object') return null;
+    const blobs = [];
+    if (hist.textoCotizacion) blobs.push(String(hist.textoCotizacion));
+    const prodArm = textoProductoBloqueAgenda(hist);
+    if (prodArm) blobs.push(prodArm);
+    const pa = Array.isArray(hist.pedidosAnteriores) ? hist.pedidosAnteriores : [];
+    for (const p of pa) {
+        if (p?.descripcion) blobs.push(String(p.descripcion));
+    }
+    if (hist.direccion) blobs.push(String(hist.direccion));
+    for (const k of ['zona', 'barrio', 'localidad', 'referencia', 'notasUbicacion']) {
+        if (hist[k]) blobs.push(String(hist[k]));
+    }
+    if (hist.servicioPendiente) blobs.push(String(hist.servicioPendiente));
+    const joined = blobs.join(' ');
+    if (!joined.trim()) return null;
+    const re = /(\d{1,4})\s*(?:kg|kilos?|k\.?\s*g\.?)\b/gi;
+    let best = null;
+    let m;
+    while ((m = re.exec(joined)) !== null) {
+        const n = parseInt(m[1], 10);
+        if (n > 0 && n <= 50000) best = n;
+    }
+    if (best != null) return best;
+    const m2 = joined.match(/\b(\d{1,4})\s*x\s*(?:kg|kilos?)\b/i);
+    if (m2) {
+        const n = parseInt(m2[1], 10);
+        if (n > 0 && n <= 50000) return n;
+    }
+    return null;
+}
+
+/** Dirección operativa: `direccion` del CRM o texto armado (lote/barrio/localidad/notas del panel). */
+function direccionOperativaDesdeClienteCrm(hist) {
+    if (!hist || typeof hist !== 'object') return 'Sin dirección';
+    const d = hist.direccion && String(hist.direccion).trim();
+    if (d) return d.slice(0, 400);
+    const parts = [hist.referencia, hist.barrio, hist.localidad, hist.zona, hist.notasUbicacion]
+        .filter(Boolean)
+        .map((x) => String(x).trim())
+        .filter(Boolean);
+    return parts.length ? parts.join(' · ').slice(0, 400) : 'Sin dirección';
+}
+
+/**
+ * kg [hogar|salamandra|parrilla] [| dirección] — cola leña admin.
+ * Resto vacío = solo contacto: nombre/dirección/zona/tipo desde CRM; kg inferido o 0.
+ */
+function parseRestoColaLenaAdmin(resto) {
+    const s = String(resto || '').trim();
+    if (!s) {
+        return { cantidadKg: null, tipoLena: null, direccionExtra: null };
+    }
+    const m = s.match(/^(\d{1,5})(?:\s+(hogar|salamandra|parrilla))?(?:\s*\|\s*([\s\S]+))?$/i);
+    if (!m) return null;
+    const cantidadKg = parseInt(m[1], 10);
+    if (!Number.isFinite(cantidadKg) || cantidadKg <= 0 || cantidadKg > 50000) return null;
+    const tipoLena = m[2] ? m[2].toLowerCase() : null;
+    const direccionExtra = (m[3] || '').trim().replace(/\s+/g, ' ').slice(0, 400) || null;
+    return { cantidadKg, tipoLena, direccionExtra };
+}
+
+async function resolverDestinatarioAdminPrefijoPalabras(tail, sesionAdmin) {
+    const s = String(tail || '').trim();
+    if (!s) return null;
+    const parts = s.split(/\s+/).filter(Boolean);
+    if (parts.length < 2) return null;
+    const maxI = Math.min(parts.length - 1, 12);
+    for (let i = 1; i <= maxI; i++) {
+        const candidato = parts.slice(0, i).join(' ');
+        const dest = await resolverDestinatarioAdmin(candidato, sesionAdmin);
+        if (dest) {
+            return { jid: dest.jid, etiqueta: dest.etiqueta, resto: parts.slice(i).join(' ').trim() };
+        }
+    }
+    return null;
+}
+
+async function resolverColaLenaAdminDestinoYResto(tail, sesion) {
+    let d = await resolverDestinatarioTelefonoPrefijoTail(tail, sesion);
+    if (d) return d;
+    d = await resolverDestinatarioAdminPrefijoPalabras(tail, sesion);
+    if (d) return d;
+    const parsedBridge = parseRestoColaLenaAdmin(tail);
+    if (sesion?.modoBridge && sesion.bridgeTarget?.jid && parsedBridge != null) {
+        return {
+            jid: sesion.bridgeTarget.jid,
+            etiqueta: sesion.bridgeTarget.etiqueta || String(sesion.bridgeTarget.jid),
+            resto: String(tail).trim(),
+        };
+    }
+    return null;
+}
+
+async function ejecutarColaLenaAdminManualSiCorresponde({
+    remoteJid,
+    sesion,
+    tAdm,
+    tieneAudioMsg,
+    limpiarCapturasGemini,
+}) {
+    const raw = String(tAdm || '').trim();
+    const mSolo = /^#\s*cola_lena\s*$/i.test(raw);
+    // \s* permite número pegado: #cola_lena549… o #cola_lena+54… (además de #cola_lena 549…)
+    const mCmd = raw.match(/^#\s*cola_lena\s*([\s\S]+)$/i);
+    if (!mSolo && !mCmd) return false;
+    if (tieneAudioMsg) {
+        await sendBotMessage(remoteJid, { text: '❌ *#cola_lena* va en texto (no audio).' });
+        return true;
+    }
+    limpiarCapturasGemini();
+    if (sesion.wizard?.tipo === 'agenda_entrega') sesion.wizard = null;
+
+    let dest;
+    if (mSolo) {
+        if (sesion?.modoBridge && sesion.bridgeTarget?.jid) {
+            dest = {
+                jid: sesion.bridgeTarget.jid,
+                etiqueta: sesion.bridgeTarget.etiqueta || String(sesion.bridgeTarget.jid),
+                resto: '',
+            };
+        } else {
+            await sendBotMessage(remoteJid, {
+                text:
+                    '🪵 *#cola_lena* — alta en *cola de leña* (ruta grupal / panel).\n\n'
+                    + '*Solo teléfono:* el bot usa *nombre, dirección, zona y tipo leña* del CRM si existen; los *kg* los intenta sacar del historial (cotización/pedidos leña). Si no hay kg → *0 kg* (pendiente; no suma al umbral hasta que pongas kg).\n'
+                    + '`#cola_lena 549…` · `#cola_lena +54 9 351 …`\n\n'
+                    + '*Opcional explícito:* `… kg` [hogar|salamandra|parrilla] [| dirección]\n'
+                    + 'Ej: `#cola_lena 5493517361472 100 salamandra | Calle X 123`\n\n'
+                    + '*Con puente #c:* `#c` al cliente → `#cola_lena` solo (mismo criterio) o `#cola_lena 100` …\n\n'
+                    + '*!!cola_lena* si WhatsApp rompe el #.',
+            });
+            persistAdminWaSessionFirestore(remoteJid).catch(() => {});
+            return true;
+        }
+    } else {
+        const tail = (mCmd[1] || '').trim();
+        if (!tail) {
+            await sendBotMessage(remoteJid, {
+                text: '❌ Mandá *#cola_lena* + teléfono, o *#cola_lena* solo con *#c* al cliente, o *#cola_lena* para la ayuda.',
+            });
+            return true;
+        }
+        dest = await resolverColaLenaAdminDestinoYResto(tail, sesion);
+        if (!dest) {
+            await sendBotMessage(remoteJid, {
+                text: '❌ No resolví el contacto. Probá tel (549…), *#n*, nombre, o *#c* + cliente y después *#cola_lena* (solo o con kg).\n'
+                    + '_Solo *#cola_lena* — ayuda._',
+            });
+            return true;
+        }
+    }
+
+    const parsed = parseRestoColaLenaAdmin(dest.resto);
+    if (parsed == null) {
+        await sendBotMessage(remoteJid, {
+            text: '❌ Tras el contacto: podés dejar solo el tel (CRM) o agregar *kg* [hogar|salamandra|parrilla] [| dirección].\n'
+                + 'Ej: … 100 · … 100 hogar · … 100 | Calle …\n'
+                + '_Solo *#cola_lena* — ayuda._',
+        });
+        return true;
+    }
+    const targetJid = dest.jid;
+    if (String(targetJid).startsWith('ig:')) {
+        await sendBotMessage(remoteJid, { text: '❌ *#cola_lena* solo WhatsApp.' });
+        return true;
+    }
+    const hist = await clienteFusionadoFirestoreMemoria(targetJid);
+    const direccion = parsed.direccionExtra || direccionOperativaDesdeClienteCrm(hist);
+    const zona =
+        (hist.zona && String(hist.zona).trim())
+        || (hist.localidad && String(hist.localidad).trim())
+        || null;
+    let nombre =
+        (hist.nombre && String(hist.nombre).trim())
+        || (hist.pushName && String(hist.pushName).trim())
+        || dest.etiqueta
+        || null;
+    if (nombre && textoPareceSoloTelefono(nombre)) nombre = null;
+
+    let cantidadKg =
+        parsed.cantidadKg != null && Number.isFinite(parsed.cantidadKg) && parsed.cantidadKg > 0
+            ? parsed.cantidadKg
+            : inferirKgLenaDesdeCliente(hist);
+    if (cantidadKg == null || !Number.isFinite(cantidadKg) || cantidadKg <= 0) {
+        cantidadKg = 0;
+    }
+
+    const tipoLena = parsed.tipoLena || normalizarTipoLenaCrmAdmin(hist.tipoLenaPreferido);
+
+    await agregarAColaLena(targetJid, nombre, direccion, zona, cantidadKg, tipoLena);
+    if (parsed.direccionExtra) {
+        actualizarEstadoCliente(targetJid, { direccion: parsed.direccionExtra });
+        const telFs = docIdClienteFirestore(targetJid, getCliente(targetJid));
+        if (telFs && firestoreModule.isAvailable() && firestoreModule.syncCliente) {
+            const fsPatch = { direccion: parsed.direccionExtra };
+            if (parsed.tipoLena) fsPatch.tipoLenaPreferido = parsed.tipoLena;
+            firestoreModule.syncCliente(telFs, fsPatch).catch(() => {});
+        }
+    } else if (parsed.tipoLena && firestoreModule.isAvailable() && firestoreModule.syncCliente) {
+        const telFs = docIdClienteFirestore(targetJid, getCliente(targetJid));
+        if (telFs) firestoreModule.syncCliente(telFs, { tipoLenaPreferido: parsed.tipoLena }).catch(() => {});
+    }
+    const jidStr = String(targetJid);
+    const refChat =
+        jidStr.endsWith('@s.whatsapp.net')
+            ? jidStr.replace(/@s\.whatsapp\.net$/i, '')
+            : jidStr.length > 28
+              ? `${jidStr.slice(0, 26)}…`
+              : jidStr;
+    const tot = totalKgEnCola();
+    const kgResumen =
+        cantidadKg > 0
+            ? `*${cantidadKg} kg*`
+            : '*0 kg (pendiente)* — no suma al umbral hasta que cargues kg (`#cola_lena … …kg` o historial CRM)';
+    const tipoTxt = tipoLena ? `🪵 Tipo: *${tipoLena}*\n` : '';
+    await sendBotMessage(remoteJid, {
+        text:
+            `✅ *Cola leña* — ${kgResumen} → *${nombre || refChat}*\n`
+            + `📱 \`${refChat}\`\n`
+            + tipoTxt
+            + `📍 ${direccion.slice(0, 120)}${direccion.length > 120 ? '…' : ''}\n`
+            + `_Total en cola (en_cola): ~*${tot}* kg / umbral ruta *${UMBRAL_COLA_KG}* kg._`,
+    });
+    persistAdminWaSessionFirestore(remoteJid).catch(() => {});
+    return true;
 }
 
 const SERVICIOS_PEDIDO_ADMIN = new Set(['lena', 'cerco', 'pergola', 'fogonero', 'bancos', 'madera']);
@@ -2251,7 +2779,7 @@ async function extraerPedidoDesdeHiloAdmin(items) {
         return `${quien}: ${r.contenido}`;
     }).join('\n');
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const model = genAI.getGenerativeModel({ model: modeloGeminiActivo() });
     const prompt = 'Sos asistente operativo. Hilo WhatsApp entre Vicky (bot Gardens Wood) y un cliente (leña, cercos, pérgolas, fogonero, madera). '
         + 'Inferí el pedido que el cliente quiere cerrar: cantidades, tipo de producto/servicio, dirección o zona si aparecen. '
         + 'Respondé SOLO JSON válido (sin markdown), formato: '
@@ -2284,7 +2812,7 @@ async function extraerEntregaAgendaDesdeContextoAdmin({ items, crmResumen, fecha
         : '(No hay mensajes guardados en Firestore para este chat; usá solo CRM y la nota del dueño si hay.)';
     const hoy = fechaHoyArg || new Date().toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Cordoba' });
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const model = genAI.getGenerativeModel({ model: modeloGeminiActivo() });
     const nota = notaDueño ? `\nIndicación extra del dueño: ${String(notaDueño).trim().slice(0, 500)}\n` : '';
     const prompt =
         'Sos asistente operativo de Gardens Wood (Córdoba, Argentina). '
@@ -2313,7 +2841,7 @@ async function extraerEntregaAgendaDesdeContextoAdmin({ items, crmResumen, fecha
 async function transcribirAudioInstructivoGemini(audioBase64, mimeType = 'audio/ogg') {
     if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY no configurada');
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const model = genAI.getGenerativeModel({ model: modeloGeminiActivo() });
     const result = await model.generateContent([
         { inlineData: { data: audioBase64, mimeType } },
         { text: 'Transcribí literalmente lo que dice el audio, en español. Devolvé solo el texto transcrito, sin comentarios ni saludo.' }
@@ -2325,7 +2853,7 @@ async function transcribirAudioInstructivoGemini(audioBase64, mimeType = 'audio/
 // NO interpreta destinatario — solo produce el texto del mensaje.
 async function redactarMensajeAdmin(audioBase64, textoContenido) {
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const model = genAI.getGenerativeModel({ model: modeloGeminiActivo() });
 
     const PROMPT_REDACCION = `Sos el asistente de redacción de Vicky, el bot de Gardens Wood.
 El dueño del negocio te manda una instrucción en audio o texto con lo que quiere decirle a un cliente.
@@ -2357,7 +2885,7 @@ async function procesarComandoAdmin(adminJid, audioBase64, textoAdmin) {
         return;
     }
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const model = genAI.getGenerativeModel({ model: modeloGeminiActivo() });
 
     try {
         let partes;
@@ -2784,23 +3312,53 @@ async function generarAudioElevenLabs(texto) {
         }
 
         const arrayBuffer = await resp.arrayBuffer();
-        return Buffer.from(arrayBuffer);
+        const buf = Buffer.from(arrayBuffer);
+        if (!buf.length || buf.length < 32) {
+            console.warn('⚠️ ElevenLabs: respuesta de audio demasiado corta');
+            return null;
+        }
+        if (buf[0] === 0x7b) {
+            console.warn('⚠️ ElevenLabs: cuerpo parece JSON (no audio):', buf.subarray(0, 160).toString('utf8'));
+            return null;
+        }
+        return buf;
     } catch (e) {
         console.error('❌ Error generando audio ElevenLabs:', e.message);
         return null;
     }
 }
 
+/** MIME coherente con los magic bytes (evita "mensaje no compatible" en WhatsApp). */
+function mimetypeAudioBufferParaWhatsapp(buf) {
+    if (!Buffer.isBuffer(buf) || buf.length < 16) return null;
+    const h = buf;
+    if (h[0] === 0x7b) return null;
+    if (h[0] === 0x4f && h[1] === 0x67 && h[2] === 0x67 && h[3] === 0x53) return 'audio/ogg';
+    if (h[0] === 0x49 && h[1] === 0x44 && h[2] === 0x33) return 'audio/mpeg';
+    if (h[0] === 0xff && (h[1] & 0xe0) === 0xe0) return 'audio/mpeg';
+    if (h[0] === 0x52 && h[1] === 0x49 && h[2] === 0x46 && h[3] === 0x46) return 'audio/wav';
+    return 'audio/mpeg';
+}
+
 async function enviarAudioElevenLabs(sendBotMessage, jid, texto) {
     const audioBuffer = await generarAudioElevenLabs(texto);
     if (!audioBuffer) return false;
+    const mime = mimetypeAudioBufferParaWhatsapp(audioBuffer);
+    if (!mime) {
+        console.warn('⚠️ Audio ElevenLabs: buffer no válido para WhatsApp, no se envía');
+        return false;
+    }
     try {
-        await sendBotMessage(jid, {
+        const sent = await sendBotMessage(jid, {
             audio: audioBuffer,
-            mimetype: 'audio/mpeg',
+            mimetype: mime,
             ptt: false
         });
-        console.log(`🎙️ Audio ElevenLabs enviado a ${jid}`);
+        if (!sent) {
+            console.warn('⚠️ Audio ElevenLabs: sendMessage falló (sin respuesta)');
+            return false;
+        }
+        console.log(`🎙️ Audio ElevenLabs enviado a ${jid} (${mime})`);
         return true;
     } catch (e) {
         console.error('❌ Error enviando audio ElevenLabs:', e.message);
@@ -2894,6 +3452,41 @@ function telefonoLineaParaFirestore(remoteJid, cliente) {
     return d.length >= 8 ? d : null;
 }
 
+/**
+ * JIDs que en Firestore `chats/*` suelen duplicar el mismo contacto (@lid ↔ @s.whatsapp.net).
+ * Sirve para #activar / #silenciar / salir admin: limpiar o poner silencio en ambos docs.
+ */
+function jidsAfinesChat(remoteJid) {
+    const jids = new Set();
+    if (!remoteJid) return jids;
+    jids.add(remoteJid);
+    if (remoteJid.endsWith('@lid')) {
+        const lidNum = remoteJid.replace(/@lid$/, '');
+        const phone = lidToPhone.get(lidNum);
+        if (phone && /^\d{10,15}$/.test(String(phone).replace(/\D/g, ''))) {
+            jids.add(`${String(phone).replace(/\D/g, '')}@s.whatsapp.net`);
+        }
+    }
+    const hist = getCliente(remoteJid);
+    if (hist?.telefono) {
+        const digits = String(hist.telefono).replace(/\D/g, '');
+        if (digits.length >= 10) jids.add(`${digits}@s.whatsapp.net`);
+    }
+    if (remoteJid.endsWith('@s.whatsapp.net')) {
+        const d = remoteJid.replace(/@s\.whatsapp\.net$/i, '').replace(/\D/g, '');
+        for (const [lidNum, tel] of lidToPhone.entries()) {
+            if (String(tel).replace(/\D/g, '') === d) {
+                jids.add(`${lidNum}@lid`);
+                break;
+            }
+        }
+        if (hist?.whatsappLid) {
+            const lid = String(hist.whatsappLid).replace(/@lid$/i, '').replace(/\D/g, '');
+            if (lid.length >= 8) jids.add(`${lid}@lid`);
+        }
+    }
+    return jids;
+}
 
 /** Fecha local Argentina (Córdoba) de mañana en formato YYYY-MM-DD. */
 function fechaIsoManianaArgentina() {
@@ -3296,12 +3889,26 @@ function primerNombreClienteDesdeHistorial(hist) {
     if (!hist) return null;
     const raw = hist.nombre || hist.pushName;
     if (!raw || !String(raw).trim()) return null;
-    return String(raw).trim().split(/\s+/)[0];
+    const full = String(raw).trim();
+    if (textoPareceSoloTelefono(full)) return null;
+    const first = full.split(/\s+/)[0];
+    if (/^(cliente|client|usuario|user|contacto|contact)$/i.test(first)) return null;
+    return first;
+}
+
+/** Contenido real del mensaje (desenvuelve ephemeral / viewOnce / plantillas que usa Baileys). */
+function mensajeInnerPlano(msg) {
+    if (!msg?.message) return null;
+    try {
+        return extractMessageContent(msg.message) || msg.message;
+    } catch (_) {
+        return msg.message;
+    }
 }
 
 /** contextInfo puede incluir externalAdReply en toques desde anuncios WhatsApp / Meta */
 function obtenerContextInfo(msg) {
-    const m = msg?.message;
+    const m = mensajeInnerPlano(msg);
     if (!m) return null;
     return (
         m.extendedTextMessage?.contextInfo
@@ -3358,7 +3965,8 @@ function bloqueLecturaChatPrevio(chatHistory) {
         if (!turn?.parts?.length) continue;
         const txt = turn.parts.map((p) => p.text).filter(Boolean).join(' ');
         if (!txt || /^\[CONTEXTO/i.test(txt) || /^Entendido,/i.test(txt)) continue;
-        const rol = turn.role === 'user' ? 'Cliente' : 'Vicky';
+        // "U:" evita que el modelo confunda la etiqueta de rol con un nombre propio ("Hola Cliente").
+        const rol = turn.role === 'user' ? 'U' : 'Vicky';
         const corto = txt.replace(/\s+/g, ' ').slice(0, 400);
         lineas.unshift(`${rol}: ${corto}`);
     }
@@ -4070,12 +4678,14 @@ async function recargarVickyGeminiSystemPrompt() {
         return false;
     }
     try {
-        const modelo = vickyRuntimeCfg.MODEL_GEMINI || 'gemini-2.5-flash';
-        let full = await firestoreModule.getSystemPrompt(SYSTEM_PROMPT);
+        const modelo = modeloGeminiActivo();
+        let full = systemPromptConAnclaGardensWood(await firestoreModule.getSystemPrompt(SYSTEM_PROMPT));
         const serviciosMap = await firestoreModule.getServicios();
         const serviciosSuffix = firestoreModule.buildServiciosPromptSuffix(serviciosMap);
         if (serviciosSuffix) full += serviciosSuffix;
         full += SYSTEM_PROMPT_SUFIJO_UBICACION_MARCADORES;
+        full += SYSTEM_PROMPT_SUFIJO_NOMBRE_SALUDO;
+        full += SYSTEM_PROMPT_SUFIJO_COLA_LENA;
         vickyGeminiModel = vickyGoogleGenAI.getGenerativeModel({
             model: modelo,
             systemInstruction: full,
@@ -4108,7 +4718,7 @@ async function connectToWhatsApp(isReconnect = false) {
         firestoreModule.migrarHistorialAFirestore(clientesHistorial).catch(console.warn);
     }
 
-    let SYSTEM_PROMPT_ACTIVO = await firestoreModule.getSystemPrompt(SYSTEM_PROMPT);
+    let SYSTEM_PROMPT_ACTIVO = systemPromptConAnclaGardensWood(await firestoreModule.getSystemPrompt(SYSTEM_PROMPT));
         const serviciosMap = await firestoreModule.getServicios();
         const serviciosSuffix = firestoreModule.buildServiciosPromptSuffix(serviciosMap);
         if (serviciosSuffix) {
@@ -4116,6 +4726,8 @@ async function connectToWhatsApp(isReconnect = false) {
             console.log('📋 Bloque DATOS_SERVICIOS_FIRESTORE anexado al system prompt.');
         }
         SYSTEM_PROMPT_ACTIVO += SYSTEM_PROMPT_SUFIJO_UBICACION_MARCADORES;
+        SYSTEM_PROMPT_ACTIVO += SYSTEM_PROMPT_SUFIJO_NOMBRE_SALUDO;
+        SYSTEM_PROMPT_ACTIVO += SYSTEM_PROMPT_SUFIJO_COLA_LENA;
 
     const TEXTO_AYUDA_BIENVENIDA_DEFAULT = '¿En qué te puedo ayudar? Escribime porfa que me es más fácil responder 😊';
         vickyRuntimeCfg.mensajeBienvenidaActivo = await firestoreModule.getMensajeBienvenidaTexto(TEXTO_AYUDA_BIENVENIDA_DEFAULT);
@@ -4128,7 +4740,9 @@ async function connectToWhatsApp(isReconnect = false) {
         if (maxEscS < minEscS + 2) maxEscS = minEscS + 8;
         vickyRuntimeCfg.DELAY_MIN = minEscS * 1000;
         vickyRuntimeCfg.DELAY_MAX = maxEscS * 1000;
-    const MODELO_GEMINI = configGeneral.modeloGemini || 'gemini-2.5-flash';
+    const MODELO_GEMINI = String(process.env.GEMINI_MODEL || '').trim()
+        || String(configGeneral.modeloGemini || '').trim()
+        || VICKY_GEMINI_MODEL_DEFAULT;
         const freqFidelRaw = parseInt(configGeneral.frecuenciaAudioFidelizacion, 10);
         vickyRuntimeCfg.FIDELIZAR_CADA = (Number.isFinite(freqFidelRaw) && freqFidelRaw >= 18)
             ? Math.min(99, freqFidelRaw)
@@ -4232,7 +4846,12 @@ async function connectToWhatsApp(isReconnect = false) {
         version,
         auth: state,
         logger: pino({ level: 'silent' }),
-        browser: Browsers.macOS('Chrome')
+        browser: Browsers.macOS('Chrome'),
+        // Menos carga al conectar; los mensajes nuevos vienen por events.upsert (notify/append).
+        syncFullHistory: false,
+        shouldSyncHistoryMessage: () => false,
+        connectTimeoutMs: 60_000,
+        keepAliveIntervalMs: 20_000,
     });
     vickySocketRef.current = socket;
 
@@ -4368,6 +4987,25 @@ async function connectToWhatsApp(isReconnect = false) {
     socket.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
+        if (connection) {
+            vickyWaHealth.connection = connection;
+            if (connection === 'open') {
+                vickyWaHealth.lastOpenAt = Date.now();
+            }
+            if (connection === 'close') {
+                vickyWaHealth.lastCloseAt = Date.now();
+                vickyWaHealth.lastDisconnectCode = lastDisconnect?.error?.output?.statusCode ?? null;
+            }
+        }
+        try {
+            const c = socket.authState?.creds;
+            if (c) {
+                vickyWaHealth.registered = !!c.registered;
+                const meId = c.me?.id || '';
+                vickyWaHealth.meUser = meId.includes('@') ? meId.split('@')[0] : meId;
+            }
+        } catch (_) { /* ignore */ }
+
         const listoParaPairing = usePairingCodeFlow && !socket.authState.creds.registered && !pairingCodeRequestSent
             && (connection === 'connecting' || !!qr);
         if (listoParaPairing) {
@@ -4433,6 +5071,9 @@ async function connectToWhatsApp(isReconnect = false) {
                 }
                 console.log('   Si el celular mostró error pero acá dice vinculado: la sesión suele estar rota. Pará el bot, borrá la carpeta auth_info_baileys y vinculá de nuevo (ideal: QR).');
             }
+            if (process.env.K_SERVICE) {
+                console.log('   Cloud Run: diagnóstico HTTP → GET /health/whatsapp (JSON: conexión WA + contador upsert).');
+            }
             pairingCodeRequestSent = false;
             if (/^(1|true|yes)$/i.test(String(process.env.VICKY_LOG_LABELS || '').trim())) {
                 console.log('\n🏷️ VICKY_LOG_LABELS activo: buscá en consola líneas "id=… name=…".');
@@ -4455,6 +5096,16 @@ async function connectToWhatsApp(isReconnect = false) {
     // ============================================================
     socket.ev.on('messages.upsert', async ({ messages, type }) => {
         try {
+            vickyWaHealth.upsertCount += 1;
+            vickyWaHealth.lastUpsertAt = Date.now();
+            if (/^(1|true|yes)$/i.test(String(process.env.VICKY_LOG_WA_UPSERT || '').trim())) {
+                const m0 = messages?.[0];
+                const jid = m0?.key?.remoteJid || '';
+                console.log(
+                    `📬 [VICKY_LOG_WA_UPSERT] type=${type} jid=${jid} fromMe=${!!m0?.key?.fromMe} hasPayload=${!!m0?.message}`
+                );
+            }
+
             // notify = tiempo real; append = cola offline (sin esto, a veces no entra la 2.ª respuesta del cliente tras reconectar)
             if (type !== 'notify' && type !== 'append') return;
 
@@ -4551,7 +5202,7 @@ async function connectToWhatsApp(isReconnect = false) {
                     await sendBotMessage(remoteJid, {
                         text: '🔐 Comando de administración no habilitado en este chat.\n\n'
                             + '• Frase secreta (ADMIN_SECRET) y *después* el comando.\n'
-                            + '• Comandos: *#g* / *!!g* / *vicky:g* (instructivo Gemini), *#c* / *!!c* (puente cliente), *#entrega* / *!!entrega* (cargar agenda con *#c* o JID; *#entrega lista* / *lista todas* para ver próximos eventos), *#final_entrega* / *!!final_entrega* (cierre datos de entrega tras humano), *#reporte* + *detalle …*, *#p* (*lista* / *lidmap* / *tel* / *+tel* / *-tel* / *N*), *#pedido* …, *#ruta* / *!!ruta*, *#ruta_geo* / *!!ruta_geo* (campaña por polilínea en panel), *#enviar …*, *#estado* / *!!estado*, *#silencio global* / *#activo global* / *#activo parcial*, *#silenciar …* / *!!silenciar …* / *#activar …*…\n'
+                            + '• Comandos: *#g* / *!!g* / *vicky:g* (instructivo Gemini), *#c* / *!!c* (puente cliente), *#entrega* / *!!entrega* (cargar agenda con *#c* o JID; *#entrega lista* / *lista todas* para ver próximos eventos), *#final_entrega* / *!!final_entrega* (cierre datos de entrega tras humano), *#cola_lena* / *!!cola_lena* (cola leña: *#cola_lena* + tel o solo con *#c* al cliente; sin puente, *#cola_lena* solo = ayuda), *#reporte* + *detalle …*, *#p* (*lista* / *lidmap* / *tel* / *+tel* / *-tel* / *N*), *#pedido* …, *#ruta* / *!!ruta*, *#ruta_geo* / *!!ruta_geo* (campaña por polilínea en panel), *#enviar …*, *#estado* / *!!estado*, *#silencio global* / *#activo global* / *#activo parcial*, *#silenciar …* / *!!silenciar …* / *#activar …*…\n'
                             + '• *Teléfono admin* en panel + *ADMIN_PHONE* en servidor si querés sin frase secreta.\n\n'
                             + '_La sesión admin se guarda en Firestore (varias réplicas Cloud Run)._'
                     });
@@ -4631,6 +5282,29 @@ async function connectToWhatsApp(isReconnect = false) {
                     const limpiarCapturaPuente = () => {
                         sesion.esperandoSelectorPuente = false;
                     };
+
+                    if (
+                        await ejecutarFinalEntregaAdminSiCorresponde({
+                            remoteJid,
+                            sesion,
+                            tAdm,
+                            tieneAudioMsg,
+                            limpiarCapturasGemini,
+                        })
+                    ) {
+                        return;
+                    }
+                    if (
+                        await ejecutarColaLenaAdminManualSiCorresponde({
+                            remoteJid,
+                            sesion,
+                            tAdm,
+                            tieneAudioMsg,
+                            limpiarCapturasGemini,
+                        })
+                    ) {
+                        return;
+                    }
 
                     // ── Wizard: agenda de entregas (menú *3*)
                     if (sesion.wizard?.tipo === 'agenda_entrega' && !tieneAudioMsg && tAdm) {
@@ -4932,7 +5606,7 @@ async function connectToWhatsApp(isReconnect = false) {
                             await sendBotMessage(remoteJid, {
                                 text:
                                     '⚙️ *Más comandos*\n\n'
-                                    + 'Podés escribirlos directo: *#reporte*, *#p lista*, *#c*, *#ruta*, *#entrega*, *#final_entrega*, *#g*, *#enviar* …\n\n'
+                                    + 'Podés escribirlos directo: *#reporte*, *#p lista*, *#c*, *#ruta*, *#entrega*, *#final_entrega*, *#cola_lena*, *#g*, *#enviar* …\n\n'
                                     + '_*menu*_ — volver al menú numerado._',
                             });
                             persistAdminWaSessionFirestore(remoteJid).catch(() => {});
@@ -5607,11 +6281,13 @@ async function connectToWhatsApp(isReconnect = false) {
                                 });
                                 return;
                             }
-                            await firestoreModule.setHumanoAtendiendo(dest.jid, true);
-                            const sCl = SESSIONS.get(dest.jid);
-                            if (sCl) {
-                                sCl.humanAtendiendo = true;
-                                sCl.humanTimestamp = Date.now();
+                            for (const jidSil of jidsAfinesChat(dest.jid)) {
+                                await firestoreModule.setHumanoAtendiendo(jidSil, true);
+                                const sSil = SESSIONS.get(jidSil);
+                                if (sSil) {
+                                    sSil.humanAtendiendo = true;
+                                    sSil.humanTimestamp = Date.now();
+                                }
                             }
                             await sendBotMessage(remoteJid, {
                                 text: `🔇 Vicky *silenciada* solo en *${dest.etiqueta}*.\nReactivar: *#activar* + mismo criterio (nombre, número, *último*, *#N*) o desde el panel.`,
@@ -5633,14 +6309,16 @@ async function connectToWhatsApp(isReconnect = false) {
                                 });
                                 return;
                             }
-                            await firestoreModule.reactivarBotEnChat(dest.jid);
-                            const sCl = SESSIONS.get(dest.jid);
-                            if (sCl) {
-                                sCl.humanAtendiendo = false;
-                                sCl.humanTimestamp = null;
+                            for (const jidAct of jidsAfinesChat(dest.jid)) {
+                                await firestoreModule.reactivarBotEnChat(jidAct);
+                                const sAct = SESSIONS.get(jidAct);
+                                if (sAct) {
+                                    sAct.humanAtendiendo = false;
+                                    sAct.humanTimestamp = null;
+                                }
                             }
                             await sendBotMessage(remoteJid, {
-                                text: `🔊 Vicky *reactivada* en chat *${dest.etiqueta}*.`,
+                                text: `🔊 Vicky *reactivada* en chat *${dest.etiqueta}* (incluye variantes @lid / @s.whatsapp.net si aplica).`,
                             });
                             return;
                         }
@@ -5678,64 +6356,31 @@ async function connectToWhatsApp(isReconnect = false) {
                                     + 'Mandá *texto o audio* con lo que querés que Vicky le diga (Gemini lo redacta y lo envía).\n'
                                     + '*#entrega* con fecha + hora + título → calendario **Agenda de entregas** (Firestore).\n'
                                     + '*#final_entrega* → quita silencio humano, mensaje al cliente y Vicky pide datos con `[ENTREGA:…]`.\n'
+                                    + '*#cola_lena* + tel (kg opcional; datos desde CRM) o con puente *#c* → *#cola_lena* solo → **cola de leña**.\n'
                                     + 'Otro cliente: *#c*. Salir: *#SALIR* / *adminoff*.'
                             });
                             return;
                         }
-                        const mFinalEntrega = tAdm.match(/^#\s*final_entrega(?:\s+([\s\S]+))?\s*$/i);
-                        if (mFinalEntrega && !tieneAudioMsg) {
-                            sesion.destinatarioPendiente = null;
-                            limpiarCapturasGemini();
-                            if (!firestoreModule.isAvailable()) {
-                                await sendBotMessage(remoteJid, { text: '❌ Firestore no disponible.' });
-                                return;
-                            }
-                            const restFe = (mFinalEntrega[1] || '').trim();
-                            let targetJid = null;
-                            let etiqueta = '';
-                            if (sesion.modoBridge && sesion.bridgeTarget?.jid) {
-                                targetJid = sesion.bridgeTarget.jid;
-                                etiqueta = sesion.bridgeTarget.etiqueta || targetJid;
-                            } else if (restFe) {
-                                const destFe = await resolverDestinatarioAdmin(restFe, sesion);
-                                if (!destFe) {
-                                    await sendBotMessage(remoteJid, {
-                                        text: '❌ No encontré ese contacto. Probá *#c* + cliente y luego *#final_entrega*, o *#final_entrega* + nombre/tel/#n.',
-                                    });
-                                    return;
-                                }
-                                targetJid = destFe.jid;
-                                etiqueta = destFe.etiqueta || targetJid;
-                            } else {
-                                await sendBotMessage(remoteJid, {
-                                    text: '❌ *#final_entrega* necesita cliente: primero *#c* (puente) o mandá *#final_entrega* + nombre, número o *#n*.\n'
-                                        + '*!!final_entrega* si WhatsApp rompe el #.',
-                                });
-                                return;
-                            }
-                            if (String(targetJid).startsWith('ig:')) {
-                                await sendBotMessage(remoteJid, {
-                                    text: '❌ *#final_entrega* aplica solo a WhatsApp, no a Instagram.',
-                                });
-                                return;
-                            }
-                            await firestoreModule.quitarHumanoAtendiendoChat(targetJid);
-                            const sFe = SESSIONS.get(targetJid);
-                            if (sFe) {
-                                sFe.humanAtendiendo = false;
-                                sFe.humanTimestamp = null;
-                            }
-                            await firestoreModule.setCierreEntregaAsistido(targetJid, true);
-                            const plantilla = await firestoreModule.getMensajeClienteCierreEntregaHumano(
-                                DEFAULT_MSJ_CLIENTE_CIERRE_ENTREGA_HUMANO
-                            );
-                            await sendBotMessage(targetJid, { text: plantilla });
-                            await sendBotMessage(remoteJid, {
-                                text: `✅ *Cierre asistido* → *${etiqueta}*\n`
-                                    + 'Se quitó silencio humano (sin tocar silencio de panel), se activó modo cierre y se envió el mensaje al cliente.\n'
-                                    + 'Vicky pedirá datos faltantes y agendará con `[ENTREGA:…]` como siempre.',
-                            });
-                            persistAdminWaSessionFirestore(remoteJid).catch(() => {});
+                        if (
+                            await ejecutarFinalEntregaAdminSiCorresponde({
+                                remoteJid,
+                                sesion,
+                                tAdm,
+                                tieneAudioMsg,
+                                limpiarCapturasGemini,
+                            })
+                        ) {
+                            return;
+                        }
+                        if (
+                            await ejecutarColaLenaAdminManualSiCorresponde({
+                                remoteJid,
+                                sesion,
+                                tAdm,
+                                tieneAudioMsg,
+                                limpiarCapturasGemini,
+                            })
+                        ) {
                             return;
                         }
                         if (/^#entrega\s+lista\b/i.test(String(tAdm || '').trim()) && !tieneAudioMsg) {
@@ -5914,26 +6559,32 @@ async function connectToWhatsApp(isReconnect = false) {
                             if (jidExplicit) {
                                 targetJid = jidExplicit[1];
                                 tituloEnt = jidExplicit[2].trim();
-                            } else if (sesion.modoBridge && sesion.bridgeTarget?.jid) {
-                                targetJid = sesion.bridgeTarget.jid;
-                                tituloEnt = tail;
                             } else {
-                                await sendBotMessage(remoteJid, {
-                                    text:
-                                        '📅 *#entrega* — mismo calendario que `[ENTREGA:…]` de Vicky (panel **Agenda de entregas**).\n\n'
-                                        + '*Opción A — con puente al cliente que estás atendiendo:*\n'
-                                        + '1) *#c* + nombre o número (o *#c* y elegí de la lista)\n'
-                                        + '2) `#entrega YYYY-MM-DD HH:mm título del evento`\n'
-                                        + '   Solo día: `#entrega YYYY-MM-DD -- Entrega leña coordinada`\n\n'
-                                        + '*Opción B — sin puente:* JID completo y después el título:\n'
-                                        + '`#entrega YYYY-MM-DD 09:00 5493512…@s.whatsapp.net 1 tn leña`\n'
-                                        + '`#entrega YYYY-MM-DD -- 276…@lid Obra cerco`\n\n'
-                                        + '*Opción C — solo teléfono (10–15 dígitos seguidos):* Vicky/Gemini lee CRM + hilo Firestore e intenta armar fecha y título:\n'
-                                        + '`#entrega 543516170743` o `#entrega 5493516170743 texto opcional para Gemini`\n\n'
-                                        + '*Listar próximos eventos (desde hoy, hora Argentina):* *#entrega lista* · con canceladas: *#entrega lista todas*\n\n'
-                                        + '_No uses #g para esto: #g es solo instructivo de Gemini al system prompt._',
-                                });
-                                return;
+                                const porTelHead = await resolverDestinatarioTelefonoPrefijoTail(tail, sesion);
+                                if (porTelHead) {
+                                    targetJid = porTelHead.jid;
+                                    tituloEnt = porTelHead.resto || tail;
+                                } else if (sesion.modoBridge && sesion.bridgeTarget?.jid) {
+                                    targetJid = sesion.bridgeTarget.jid;
+                                    tituloEnt = tail;
+                                } else {
+                                    await sendBotMessage(remoteJid, {
+                                        text:
+                                            '📅 *#entrega* — mismo calendario que `[ENTREGA:…]` de Vicky (panel **Agenda de entregas**).\n\n'
+                                            + '*Opción A — con puente al cliente que estás atendiendo:*\n'
+                                            + '1) *#c* + nombre o número (o *#c* y elegí de la lista)\n'
+                                            + '2) `#entrega YYYY-MM-DD HH:mm título del evento`\n'
+                                            + '   Solo día: `#entrega YYYY-MM-DD -- Entrega leña coordinada`\n\n'
+                                            + '*Opción B — sin puente:* tel al inicio del texto o JID completo:\n'
+                                            + '`#entrega YYYY-MM-DD 09:00 +54 9 351 7361472 1 tn leña`\n'
+                                            + '`#entrega YYYY-MM-DD -- 5493512…@s.whatsapp.net Obra cerco`\n\n'
+                                            + '*Opción C — solo teléfono (10–15 dígitos seguidos):* Vicky/Gemini lee CRM + hilo Firestore e intenta armar fecha y título:\n'
+                                            + '`#entrega 543516170743` o `#entrega 5493516170743 texto opcional para Gemini`\n\n'
+                                            + '*Listar próximos eventos (desde hoy, hora Argentina):* *#entrega lista* · con canceladas: *#entrega lista todas*\n\n'
+                                            + '_No uses #g para esto: #g es solo instructivo de Gemini al system prompt._',
+                                    });
+                                    return;
+                                }
                             }
                             if (!tituloEnt) {
                                 await sendBotMessage(remoteJid, { text: '❌ Falta el título del evento.' });
@@ -6073,7 +6724,7 @@ async function connectToWhatsApp(isReconnect = false) {
 
                     // Modo puente: reenviar al cliente (Gemini) salvo comandos # explícitos
                     if (sesion?.modoBridge && sesion.bridgeTarget && (tieneAudioMsg || tAdm)) {
-                        const esComandoHash = /^#\s*(g|ruta|c|reporte|salir|enviar|silencio|silenciar|activar|activo|vicky|entrega|final_entrega)\b/i.test(tAdm)
+                        const esComandoHash = /^#\s*(g|ruta|c|reporte|salir|enviar|silencio|silenciar|activar|activo|vicky|entrega|final_entrega|cola_lena)\b/i.test(tAdm)
                             || /^#\s*estado\s*$/i.test(tAdm);
                         if (tieneAudioMsg || (tAdm && !esComandoHash)) {
                             let audioB64 = null;
@@ -6283,6 +6934,22 @@ Ejemplos de cómo traducir instrucciones:
                         }
                         return;
                     }
+                } else {
+                    const tr = String(textoRaw || '').trim();
+                    const pareceCmdAdmin =
+                        /^[#\uFF03]/.test(tr)
+                        || /^vicky\s*:/i.test(tr)
+                        || tr.toLowerCase().startsWith(ADMIN_SECRET);
+                    if (pareceCmdAdmin) {
+                        await sendBotMessage(remoteJid, {
+                            text: '🔐 *No se pudo ejecutar el comando admin en este mensaje.*\n\n'
+                                + '• *Misma cuenta Business:* si pegaste `#cola_lena` y el número *sin espacio*, probá `#cola_lena 549…` o `!!cola_lena 549…`.\n'
+                                + '• *Otro celular:* frase secreta + comando, o *adminPhone* / *ADMIN_PHONE* para usar `#…` sin clave.\n\n'
+                                + '_Para diagnosticar: *VICKY_LOG_ADMIN=1* en el servidor y mirá la consola al mandar el comando._',
+                        }).catch(() => {});
+                        return;
+                    }
+                    // Mensaje de cliente normal: no retornar — seguir al flujo Vicky (silencio, botActivo, Gemini).
                 }
                 } finally {
                     // No tocar Firestore en chats cliente (!fromMe sin teléfono admin): evita deletes innecesarios por mensaje.
@@ -6313,6 +6980,13 @@ Ejemplos de cómo traducir instrucciones:
                         s.humanTimestamp = Date.now();
                     }
                     return;
+                }
+                // Firestore = no silenciado: alinear RAM. Sin esto, `session.humanAtendiendo` viejo (misma réplica u
+                // otra instancia Cloud Run antes de #activo global / panel) sigue bloqueando aunque `chats/*` ya esté OK.
+                const sAlinear = SESSIONS.get(remoteJid);
+                if (sAlinear) {
+                    sAlinear.humanAtendiendo = false;
+                    sAlinear.humanTimestamp = null;
                 }
             }
 
@@ -6415,13 +7089,15 @@ Ejemplos de cómo traducir instrucciones:
                 }
             }
 
-            // --- EXTRAER TEXTO, IMAGEN Y AUDIO ---
+            // --- EXTRAER TEXTO, IMAGEN Y AUDIO (inner: ephemeral, viewOnce, plantillas) ---
+            const inner = mensajeInnerPlano(msg) || msg.message;
             const text = (
-                msg.message.conversation ||
-                msg.message.extendedTextMessage?.text ||
-                msg.message.imageMessage?.caption ||
-                msg.message.videoMessage?.caption ||
-                ''
+                inner.conversation
+                || inner.extendedTextMessage?.text
+                || inner.imageMessage?.caption
+                || inner.videoMessage?.caption
+                || inner.documentMessage?.caption
+                || ''
             ).trim();
 
             const publicidadLead = detectarServicioDesdePublicidad(msg, text);
@@ -6439,11 +7115,17 @@ Ejemplos de cómo traducir instrucciones:
                 firestoreModule.syncCliente(docIdClienteFirestore(remoteJid, clAd), pubPatch).catch(() => {});
             }
 
-            const tieneImagen = !!(msg.message.imageMessage);
-            const tieneAudio = !!(msg.message.audioMessage || msg.message.pttMessage);
+            const tieneImagen = !!(inner.imageMessage);
+            const tieneAudio = !!(inner.audioMessage || inner.pttMessage);
 
             // Ignorar si no hay texto, imagen ni audio
-            if (!text && !tieneImagen && !tieneAudio) return;
+            if (!text && !tieneImagen && !tieneAudio) {
+                if (/^(1|true|yes)$/i.test(String(process.env.VICKY_LOG_MSG_DROP || '').trim())) {
+                    const keys = msg.message ? Object.keys(msg.message).slice(0, 12).join(',') : '';
+                    console.log(`🗑️ [VICKY_LOG_MSG_DROP] Sin texto/media jid=${remoteJid} keys=${keys}`);
+                }
+                return;
+            }
 
             console.log(`📨 Mensaje de ${remoteJid}: "${text.substring(0, 80)}"${tieneImagen ? ' 📷 [imagen]' : ''}${tieneAudio ? ' 🎤 [audio]' : ''}${publicidadLead ? ` 📢 [ad:${publicidadLead.servicio}]` : ''}`);
 

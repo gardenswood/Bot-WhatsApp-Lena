@@ -30,7 +30,10 @@ function runDeploy() {
   log('🤖 Desplegando bot Vicky...', '\x1b[33m')
 
   if (DRY_RUN) {
-    log(`(DRY RUN) gcloud run deploy ${SERVICE} --source . --region=${REGION}`, '\x1b[35m')
+    log(
+      `(DRY RUN) gcloud run deploy ${SERVICE} --source . --region=${REGION} --min-instances=1 --max-instances=1 --no-cpu-throttling --timeout=3600 --memory=1Gi`,
+      '\x1b[35m'
+    )
     return
   }
 
@@ -39,7 +42,8 @@ function runDeploy() {
     log('📦 Construyendo en Cloud Build...')
 
     execSync(
-      `gcloud run deploy ${SERVICE} --source . --region=${REGION} --platform=managed --port=8080`,
+      `gcloud run deploy ${SERVICE} --source . --region=${REGION} --platform=managed --port=8080 `
+        + `--min-instances=1 --max-instances=1 --no-cpu-throttling --timeout=3600 --memory=1Gi`,
       { cwd: ROOT, stdio: 'inherit', timeout: 600_000 }
     )
 

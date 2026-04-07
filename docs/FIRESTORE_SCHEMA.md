@@ -2,6 +2,8 @@
 
 Fuente de verdad para alinear bot, dashboard y archivos en [`firebase/`](../firebase/). El bot usa **Firebase Admin SDK** (no evalúa reglas de seguridad). El dashboard usa **Client SDK** (sí evalúa reglas).
 
+Operación del panel, redeploy y recuperación de prompts: [`CONFIGURACION_PANEL_Y_BOT.md`](./CONFIGURACION_PANEL_Y_BOT.md).
+
 ## Colecciones
 
 ### `config` (documentos fijos)
@@ -9,7 +11,7 @@ Fuente de verdad para alinear bot, dashboard y archivos en [`firebase/`](../fire
 | Documento | Campos principales | Escritura | Lectura bot |
 |-----------|-------------------|-----------|-------------|
 | `general` | `delayMinSeg`, `delayMaxSeg`, `modeloGemini`, `frecuenciaAudioFidelizacion`, `tiempoSilencioHumanoHoras`, `botActivo`, **`instagramDmActivo`**, `adminPhone`, **`datosEntregaNotifyPhone`**, horarios atención, `whatsappLabelIdContactarAsesor`, campañas (`campanaDelayMinSeg`, `campanaDelayMaxSeg`, `campanaMaxDestinatarios`, `campanaDescuentoPct`, `campanaRutaFechaTexto`, `campanaRutaPlantilla`), **`geocodeCronActivo`**, **`geocodeCronMaxPorEjecucion`**, **`whatsappGrupoJidAgendaEntregas`** (JID `…@g.us` — aviso al grupo al crear `entregas_agenda`), **`notificarAgendaEntregasGrupoActivo`** (default true) | Panel → General | Cache ~5 min en la mayoría de campos; **`whatsappGrupoJidAgendaEntregas`** / toggle agenda se leen **sin caché** en cada aviso al grupo (evita JID vacío tras guardar en panel). Hook + sondeo ~50 s |
-| `prompts` | `sistemaPrompt`, `sistemaPromptAdmin`, `mensajeBienvenidaTexto`, **`mensajeClienteCierreEntregaHumano`** (WhatsApp al cliente al disparar admin `#final_entrega`), **`instruccionCierreEntregaHumanoGemini`** (bloque extra al modelo mientras `chats/{jid}.cierreEntregaAsistido`) | Panel → Instrucciones AI | Prompts de cierre: **cada turno** vía getters; `sistemaPrompt` al arranque |
+| `prompts` | `sistemaPrompt`, `sistemaPromptAdmin`, `mensajeBienvenidaTexto`, **`mensajeClienteCierreEntregaHumano`** (WhatsApp al cliente al disparar admin `#final_entrega`), **`instruccionCierreEntregaHumanoGemini`** (bloque extra al modelo mientras `chats/{jid}.cierreEntregaAsistido`) | Panel → Instrucciones AI | Al armar Gemini, el bot **anteponde** (código) el bloque fijo *IDENTIDAD GARDENS WOOD* y luego `sistemaPrompt` (o fallback `SYSTEM_PROMPT` en `bot.js`). Después: bloque servicios + `SYSTEM_PROMPT_SUFIJO_*` (ubicación, nombre, cola leña). Mantener `sistemaPrompt` alineado solo a Gardens Wood (no mezclar otro negocio). |
 
 **Subcolección** `config/prompts/versiones/{id}` — historial de versiones del prompt (panel).
 
@@ -154,7 +156,7 @@ Pedidos pequeños de leña (≤200 kg por marcador); **fuente operativa del bot*
 | `id` (doc) | string | Estable: `cola_{dígitosWhatsApp}` (mismo criterio que el tel en JID, sin `@s.whatsapp.net`). |
 | `remoteJid` | string | JID WhatsApp del cliente. |
 | `nombre`, `direccion`, `zona` | string | CRM / cola. |
-| `cantidadKg` | number | Kg del pedido en cola. |
+| `cantidadKg` | number | Kg del pedido en cola. Puede ser **0** (pendiente) en alta manual `#cola_lena` solo con tel/CRM sin kg en historial; no suma al umbral de ruta hasta actualizar. |
 | `tipoLena` | string (opcional) | `hogar`, `salamandra` o `parrilla` si Gemini emitió `[PEDIDO_LENA:kg\|dir\|tipo]`. |
 | `tel` | string (opcional) | Dígitos para búsqueda y display en panel. |
 | `fechaPedido` | Timestamp | En Firestore; en GCS el JSON puede llevar ISO string. |
