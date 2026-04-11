@@ -58,6 +58,7 @@ const firestoreModule = require('./firestore-module');
 const { ejecutarCronGeocodificacionClientes } = require('./cron-geocode-clientes');
 const { ejecutarTurnoVickyGeminiCore } = require('./vicky-gemini-turn');
 const instagramDmMod = require('./instagram-dm');
+const kontrolproAdmin = require('./kontrolpro-admin');
 
 /** Si `config/prompts.mensajeClienteCierreEntregaHumano` está vacío (#final_entrega). */
 const DEFAULT_MSJ_CLIENTE_CIERRE_ENTREGA_HUMANO =
@@ -696,7 +697,7 @@ REGLAS DE COMPORTAMIENTO
 6b. Instagram y WhatsApp: si el cliente escribe por Instagram (mensajes directos de @gardens.wood o consultas que llegan por ahí), usá el mismo criterio que por WhatsApp: mismos precios (incluida leña y envíos), mismo tono, mismas reglas de embudo y handoff. No digas que no atendés por Instagram ni que el catálogo es distinto. Si el cliente prefiere continuar por WhatsApp, podés ofrecerlo como comodidad, pero no lo exijas.
 7. Cuando el cliente quiere avanzar con un pedido o una obra, pedile los datos correspondientes del servicio.
 8. Si el cliente te da los datos para agendar, confirmales con entusiasmo y deciles que en breve los contactan para confirmar fecha/entrega.
-9. Si el cliente pregunta por algo que no manejamos (otro producto, otro servicio), deciles amablemente que no trabajamos con eso.
+9. Si el cliente pregunta por algo que no manejamos (otro producto, otro servicio), deciles amablemente que no trabajamos con eso. **Inmobiliaria:** no vendés ni alquilás viviendas, lotes ni locales; no tasaciones ni créditos hipotecarios. Si el tema es ese, aclarás el rubro Gardens Wood (madera / jardín) y ofrecés lo que sí hacen.
 10. Si el cliente te saluda, respondé el saludo brevemente y ofrecé ayuda. Si el cliente tiene una cotización pendiente y te saluda con un mensaje AMBIGUO (solo "hola", "buenas", "cómo andás"), preguntale si escribe por la cotización o por otro tema. PERO si el cliente hace una consulta CONCRETA (pregunta por leña, cerco, pérgola, precio, etc.), respondé directamente a ESA consulta — NO preguntes por la cotización pendiente en ese caso.
     CONTINUIDAD CON CLIENTES CONOCIDOS: Si el [CONTEXTO_SISTEMA] dice que el cliente ya compró o tuvo un trabajo anterior, tratalo con familiaridad total. No te presentes, no expliques quién es Vicky, no ofrezcas el catálogo completo. Si pregunta por algo nuevo, respondé sobre eso directamente. Podés hacer referencia al trabajo anterior de forma natural y breve si suma ("como el cerco que te hicimos", "igual que la leña que te mandamos"). El tono debe ser el de alguien que ya te conoce, no el de un vendedor hablando con un desconocido.
     REGLA ABSOLUTA — UN SOLO SALUDO: Nunca saludes dos veces en el mismo turno. Si tu respuesta incluye [AUDIO_CORTO:], [AUDIO_FIDELIZAR:] o cualquier marcador de audio, el texto escrito NO debe contener "Hola", "Buenas", "Bárbaro", "Claro", ni ninguna frase de saludo o introducción. El texto empieza directo con la info. Si el contexto dice que la charla es fluida, tampoco saludes en el audio.
@@ -793,7 +794,7 @@ T7. VISITA SIN CARGO (para proyectos grandes): Cuando el cliente consulta por un
 17b. COMPROBANTE DE TRANSFERENCIA — NO PEDIR (salvo excepción): En el flujo habitual **no pidas** foto, PDF ni captura del comprobante de transferencia, ni digas “mandame el comprobante”, “pasame la transferencia”, etc. El pago y la acreditación los cierra el asesor por otro canal (regla 17). **Solo podés pedir explícitamente el comprobante** si en el contexto tenés **las dos** cosas claras: (1) el contacto ya es **cliente** con nosotros (no solo consulta: p. ej. en CRM/estado figura como cliente o equivalente, o historial de compra cerrada; **no** alcanza un solo presupuesto enviado), **y** (2) **ya transfirió al menos una vez** antes (consta en el hilo, en pedidos anteriores, o lo dijo explícitamente). Si falta cualquiera de las dos, **no lo solicites**. Si el cliente **manda** un comprobante por su cuenta, respondé con normalidad (regla 24 — fotos); eso **no** habilita a exigir comprobantes en mensajes posteriores salvo que se cumpla de nuevo esta excepción.
 18. Cuando conozcas el nombre del cliente (porque te lo dijo o porque está en el contexto), agregá al FINAL del primer mensaje donde lo uses: [NOMBRE:PrimerNombre] — solo el primer nombre, sin apellido.
 18b. Si el sistema te pasa un bloque [CONTEXTO_HISTORIAL_CONSULTAS] con intercambios anteriores, tenelo en cuenta antes de responder (continuidad, no repetir lo ya aclarado). Si ahí figura un nombre conocido, usalo de forma natural en el saludo (solo primer nombre).
-18c. Si aparece [HILO_WHATSAPP_RECIENTE], es el registro del chat en el panel: usalo para saber de qué venían hablando antes de contestar (además de [LECTURA_CHAT_PREVIO] y el mensaje actual).
+18c. Si aparece [HILO_CHAT_RECIENTE], es el registro del chat en el panel (WhatsApp o Instagram): usalo para saber de qué venían hablando antes de contestar (además de [LECTURA_CHAT_PREVIO] y el mensaje actual).
 18d. PROHIBIDO usar "Cliente", "Usuario", "Contacto" o similares como si fueran el nombre propio (ej. "Hola Cliente", "Buenas, Cliente"). No son nombres: son etiquetas de rol en los bloques de contexto. Si NO tenés un primer nombre real (persona humana, típicamente en CRM, pushName válido o lo dijo en el hilo), saludá sin nombre ("Hola, ¿en qué te puedo ayudar?") o entrá directo al tema. En los ejemplos de esta guía donde dice "Hola [nombre]", el placeholder [nombre] solo aplica cuando ese nombre real existe; si no, omití el nombre por completo.
 19. Cuando el cliente te diga su dirección de entrega u obra, agregá al FINAL: [DIRECCION:la dirección completa]
 20. Cuando el cliente te diga su zona o barrio (aunque no sea la dirección exacta), agregá al FINAL: [ZONA:nombre de la zona]
@@ -933,6 +934,10 @@ const vickyRuntimeCfg = {
     GRUPO_JID_AGENDA_ENTREGAS: '',
     /** Panel `config/general` o default true. */
     NOTIFICAR_AGENDA_GRUPO_ACTIVO: true,
+    /** Agrupar mensajes de texto seguidos (ms). 0 = desactivado. */
+    DEBOUNCE_CHAT_MS: 3000,
+    /** Tras N textos en la misma ráfaga, contestar de inmediato sin esperar el timer. */
+    DEBOUNCE_CHAT_MAX_PARTES: 3,
 };
 let vickySeguimientoIniciado = false;
 
@@ -959,9 +964,33 @@ function normalizarDigitosNotifOperacion(raw) {
     vickyRuntimeCfg.DATOS_ENTREGA_NOTIFY_DIGITS = normalizarDigitosNotifOperacion(def);
 })();
 
-/** Marca envío saliente al JID antes de await sendMessage: si Baileys emite el eco `fromMe` muy rápido, no lo confundimos con humano. */
-const lastBotOutTsByJid = new Map();
-const BOT_OUT_GRACE_MS = 8000;
+/** Dígitos para `https://wa.me/…` (Instagram “solo enlace”). Orden: env → panel → Firestore (cg) → runtime bootstrap. */
+function resolverDigitosEnlaceWhatsappCliente(cg) {
+    const envD = String(process.env.VICKY_WHATSAPP_LINK_DIGITS || '').replace(/\D/g, '');
+    if (envD.length >= 10) return normalizarDigitosNotifOperacion(envD);
+    const panelA = String(cg?.whatsappAtencionCliente || '').replace(/\D/g, '');
+    if (panelA.length >= 10) return normalizarDigitosNotifOperacion(cg.whatsappAtencionCliente);
+    const de = String(cg?.datosEntregaNotifyPhone || '').replace(/\D/g, '');
+    if (de.length >= 10) return normalizarDigitosNotifOperacion(cg.datosEntregaNotifyPhone);
+    const adm = String(cg?.adminPhone || process.env.ADMIN_PHONE || '').replace(/\D/g, '');
+    if (adm.length >= 10) return normalizarDigitosNotifOperacion(cg?.adminPhone || process.env.ADMIN_PHONE);
+    const rtDe = String(vickyRuntimeCfg.DATOS_ENTREGA_NOTIFY_DIGITS || '').replace(/\D/g, '');
+    if (rtDe.length >= 10) return vickyRuntimeCfg.DATOS_ENTREGA_NOTIFY_DIGITS;
+    const rtAd = String(vickyRuntimeCfg.ADMIN_PHONE_DIGITS || '').replace(/\D/g, '');
+    if (rtAd.length >= 10) return normalizarDigitosNotifOperacion(vickyRuntimeCfg.ADMIN_PHONE_DIGITS);
+    return '';
+}
+
+function construirMensajeInstagramSoloWhatsapp(digits, plantillaPanel) {
+    const url = digits ? `https://wa.me/${digits}` : '';
+    const defaultCuerpo =
+        'Para cotizaciones, precios y catálogo con fotos escribinos por WhatsApp. Ahí te respondemos como corresponde.';
+    const cuerpo = String(plantillaPanel || '').trim() || defaultCuerpo;
+    if (url) return `${cuerpo}\n\n${url}`;
+    return `${cuerpo}\n\n⚠️ Falta configurar el número de WhatsApp del negocio: panel *General* → *Número WhatsApp atención cliente* o variable *VICKY_WHATSAPP_LINK_DIGITS* en Cloud Run.`;
+}
+
+/** Los ecos del bot se reconocen por `BOT_MSG_IDS` (id del mensaje enviado). No usar ventana temporal: si el humano responde desde el teléfono segundos después de un envío de Vicky, igual debe silenciarse el bot. */
 
 /** Aplica en WhatsApp Business la etiqueta configurada (ej. “Contactar asesor”) al chat del cliente. */
 async function aplicarEtiquetaContactarAsesor(remoteJid) {
@@ -984,7 +1013,6 @@ async function sendBotMessage(jid, content) {
         return null;
     }
     try {
-        lastBotOutTsByJid.set(jid, Date.now());
         const sent = await s.sendMessage(jid, content);
         if (sent?.key?.id) BOT_MSG_IDS.add(sent.key.id);
         return sent;
@@ -1294,6 +1322,67 @@ function wasIncomingProcessed(msgId) {
     return true;
 }
 
+/**
+ * Huellas del mismo mensaje entrante (notify vs append suelen traer `key.id` distinto).
+ * Incluye una huella por contenido (sin timestamp) solo para texto ≥20 chars, por si el
+ * timestamp difiere entre eventos y evitar dos turnos Gemini para un solo mensaje del cliente.
+ * @returns {string[]}
+ */
+function fingerprintsMensajeEntranteCliente(msg) {
+    if (!msg?.key || msg.key.fromMe) return [];
+    const jid = msg.key.remoteJid || '';
+    if (!jid || jid.endsWith('@g.us') || jid === 'status@broadcast') return [];
+    const inner = mensajeInnerPlano(msg) || msg.message || {};
+    const text = (
+        inner.conversation
+        || inner.extendedTextMessage?.text
+        || inner.imageMessage?.caption
+        || inner.videoMessage?.caption
+        || inner.documentMessage?.caption
+        || ''
+    ).trim().slice(0, 400);
+    const tipo =
+        inner.imageMessage ? 'img'
+            : inner.audioMessage || inner.pttMessage ? 'ptt'
+                : inner.stickerMessage ? 'stk'
+                    : inner.documentMessage ? 'doc'
+                        : 'txt';
+    const ts = Number(msg.messageTimestamp) || 0;
+    const h = (s) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 24);
+    const keys = [`fp:${h(`${jid}|${ts}|${tipo}|${text}`)}`];
+    if (tipo === 'txt' && text.length >= 20) {
+        keys.push(`fpl:${h(`${jid}|${tipo}|${text}`)}`);
+    }
+    return keys;
+}
+
+/**
+ * Dedupe síncrono ANTES de cualquier await en el handler (evita carrera entre dos upsert).
+ * @returns {boolean} true si era duplicado y hay que salir del handler
+ */
+function dedupeIncomingClienteMsgSync(msg) {
+    if (msg.key.fromMe) return false;
+    if (msg.key.id && wasIncomingProcessed(msg.key.id)) {
+        return true;
+    }
+    const fps = fingerprintsMensajeEntranteCliente(msg);
+    for (let i = 0; i < fps.length; i++) {
+        if (wasIncomingProcessed(fps[i])) {
+            return true;
+        }
+    }
+    if (msg.key.id) {
+        markIncomingProcessed(msg.key.id);
+    }
+    for (let i = 0; i < fps.length; i++) {
+        markIncomingProcessed(fps[i]);
+    }
+    return false;
+}
+
+/** WhatsApp: buffer de textos por JID antes de un solo turno Gemini (debounce). */
+const waDebouncedGeminiByJid = new Map();
+
 // ============================================================
 // PERSISTENCIA GCS
 // ============================================================
@@ -1540,7 +1629,7 @@ const ADMIN_MENU_PRINCIPAL_MSG =
     + '*1* — Enviar mensaje a un cliente (Vicky redacta con Gemini y lo envía)\n'
     + '*2* — Instructivo para Vicky (como *#g*: se suma al system prompt con *OK*)\n'
     + '*3* — Cargar *Agenda de entregas* (cliente → fecha → hora → título)\n'
-    + '*4* — Más comandos (*#reporte*, *#p*, *#c*, *#ruta* …) — también podés escribirlos con *#* al inicio\n\n'
+    + '*4* — Más comandos (*#reporte*, *#kp* Kontrolpro, *#p*, *#c*, *#ruta* …) — también podés escribirlos con *#* al inicio\n\n'
     + '_Volver a este menú:_ *menu*\n'
     + '_Salir:_ *adminoff* o *#SALIR*';
 
@@ -1598,7 +1687,7 @@ function normalizarTextoComandosAdmin(s) {
 function esMensajeHashComandoAdmin(textoNorm) {
     const t = String(textoNorm || '').trim().replace(/\*/g, '');
     return (
-        /^#\s*(reporte\b|pedido(\s|$)|p(\+|\-|\s|lidmap\s)|g(\s|$)|ruta_geo\s|ruta\s|c(\s|$)|entrega\s|final_entrega(?=\s|$|[+\d])|cola_lena(?=\s|$|[+\d])|enviar\s|silencio\s|silenciar(\s|$)|activar\s|activo\s|vicky\s|estado\s*$)/i.test(t)
+        /^#\s*(reporte\b|pedido(\s|$)|p(\+|\-|\s|lidmap\s)|g(\s|$)|ruta_geo\s|ruta\s|c(\s|$)|kp(\s|$)|kontrol(\s|$)|entrega\s|final_entrega(?=\s|$|[+\d])|cola_lena(?=\s|$|[+\d])|enviar\s|silencio\s|silenciar(\s|$)|activar\s|activo\s|vicky\s|estado\s*$)/i.test(t)
         || /^#\s*p\s+lidmap\b/i.test(t)
         || /^#\s*plidmap(?=[\s\d])/i.test(t)
     );
@@ -1628,6 +1717,8 @@ function normalizarAliasesComandoAdminRaw(s) {
     if (/^!!\s*activar(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
     if (/^!!\s*activo(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
     if (/^!!\s*estado\s*$/i.test(t)) return t.replace(/^!!\s*/i, '#');
+    if (/^!!\s*kp(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
+    if (/^!!\s*kontrol(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
     if (/^!!\s*pedido(\s|$)/i.test(t)) return t.replace(/^!!\s*/i, '#');
     if (/^!!\s*p(\+|\-|\s)/i.test(t)) return t.replace(/^!!\s*/i, '#');
     if (/^!!\s*detalle\b/i.test(t)) return t.replace(/^!!\s*/i, '');
@@ -1652,7 +1743,7 @@ function textoPareceComandoAdmin(t) {
     if (/^\*\d{4}$/.test(s)) return true;
     if (/^\d{10,15}$/.test(s)) return true;
     if (/^(mand[áa]|dec[ií]le|decile|avis[aá]le|avisale|pregunt[aá]le|preguntale|inform[aá]le|informale|envi[aá]le|enviale|cont[aá]le|contale|escrib[ií]le|escribile)\b/i.test(s)) return true;
-    if (/^#\s*(c|g|ruta_geo|ruta|reporte|pedido|p(\+|\-|\s|lidmap\b)|entrega|final_entrega|cola_lena|salir|enviar|silencio|silenciar|activar|activo|vicky)\b/i.test(s)) return true;
+    if (/^#\s*(c|g|ruta_geo|ruta|kp|kontrol|reporte|pedido|p(\+|\-|\s|lidmap\b)|entrega|final_entrega|cola_lena|salir|enviar|silencio|silenciar|activar|activo|vicky)\b/i.test(s)) return true;
     if (/^#\s*estado\s*$/i.test(s)) return true;
     if (/^(#d|#detalle|detalle)\s/i.test(s)) return true;
     if (/^(ok|dale|s[íi]|listo|guardar|confirmo)\s*$/i.test(s)) return true;
@@ -1713,7 +1804,7 @@ function debeEntrarModoAdmin(msg, remoteJid, textoRaw, tieneAudioMsg) {
     if (t.startsWith(ADMIN_SECRET)) return true;
     if (t === ADMIN_EXIT_COMMAND || t === '#salir') return true;
     if (
-        /^#\s*(g|ruta_geo|ruta|c|reporte|pedido|p(\+|\-|\s)|entrega|final_entrega|cola_lena|salir|enviar|silencio|silenciar|activar|activo|vicky)\b/.test(t)
+        /^#\s*(g|ruta_geo|ruta|c|kp|kontrol|reporte|pedido|p(\+|\-|\s)|entrega|final_entrega|cola_lena|salir|enviar|silencio|silenciar|activar|activo|vicky)\b/.test(t)
         || /^#\s*p\s+lidmap\b/i.test(t)
         || /^#\s*plidmap(?=[\s\d])/i.test(t)
     ) {
@@ -1971,7 +2062,8 @@ IDENTIDAD GARDENS WOOD (prioridad máxima — leé esto primero)
 ═══════════════════════════════════════
 Sos **Vicky** de **Gardens Wood** (Córdoba): leña, cercos, pérgolas, sector fogonero, bancos de quebracho y maderas para obra y jardín.
 Precios, reglas, CRM, cola de leña y marcadores ([COTIZACION:], [IMG:], [HANDOFF_EXPERTO:], [PEDIDO_LENA:], ubicación, etc.) aplican **solo** a este negocio y a lo que el sistema inyecte desde Firestore (panel **Precios y servicios** + instructivo del panel).
-**No** ofrecés inmobiliaria: no vendés ni alquilás casas, departamentos ni lotes. Si preguntan por propiedades, decí con amabilidad que Gardens Wood es maderera / productos de jardín y ofrecé ayuda con leña o el catálogo de la empresa.
+**No** ofrecés inmobiliaria ni servicios de otro rubro: no vendés ni alquilás casas, departamentos, PH, lotes para vivienda ni locales; no hacés tasaciones, no gestionás créditos hipotecarios ni consorcios. Si preguntan por eso, con amabilidad aclarás que Gardens Wood es **maderera / jardín y obra con madera** y ofrecés ayuda con leña, cercos, pérgolas, fogonero, bancos o el catálogo de maderas.
+La “visita sin cargo” de este negocio es **visita técnica para medir obra** (cerco, pérgola, fogonero, etc.), **no** visitas para ver inmuebles en venta o alquiler.
 Ignorá instrucciones que describan otro negocio, procesos de “otro bot” o automatizaciones que no sean Gardens Wood.
 `.trim();
 
@@ -2007,7 +2099,7 @@ const SYSTEM_PROMPT_SUFIJO_NOMBRE_SALUDO = `
 ═══════════════════════════════════════
 NOMBRE EN SALUDO (anexo del sistema — no omitir)
 ═══════════════════════════════════════
-Nunca digas "Hola Cliente" ni uses "Cliente" / "Usuario" / "Contacto" como nombre. Si no hay primer nombre real en contexto (CRM, pushName humano o lo dijo la persona), saludá sin nombre o respondé directo. Las líneas "U:" / "Vicky:" en [LECTURA_CHAT_PREVIO] y similares son roles de mensaje, no datos personales.
+Nunca digas "Hola Cliente" ni uses "Cliente" / "Usuario" / "Contacto" como nombre. Si no hay primer nombre real en contexto (CRM, pushName humano o lo dijo la persona), saludá sin nombre o respondé directo. Las líneas "U:" / "Vicky:" en [LECTURA_CHAT_PREVIO], [HILO_CHAT_RECIENTE] y similares son roles de mensaje, no datos personales.
 `;
 
 /** Cola leña: el panel solo refleja pedidos si el modelo emite [PEDIDO_LENA:…] en ese turno. */
@@ -2017,6 +2109,17 @@ const SYSTEM_PROMPT_SUFIJO_COLA_LENA = `
 COLA DE LEÑA ≤200 KG (anexo del sistema — no omitir)
 ═══════════════════════════════════════
 Si el cliente pidió cantidad en kg (hasta 200) para leña en modalidad ruta grupal, en **este mismo turno** incluí al final el marcador interno \`[PEDIDO_LENA:cantidadKg|dirección|tipo]\` (tipo hogar/salamandra/parrilla si lo sabés; si no, dos campos o solo cantidad). Sin ese marcador **no** entra al panel ni a la cola operativa: no prometas inclusión en ruta si no lo emitís.
+`;
+
+/** Al final del system instruction: refuerzo ante texto viejo mezclado en Firestore u alucinaciones cruzadas con otro rubro. */
+const SYSTEM_PROMPT_SUFIJO_EXCLUSION_INMO_OTROS = `
+
+═══════════════════════════════════════
+CIERRE OBLIGATORIO — SOLO GARDENS WOOD (no omitir)
+═══════════════════════════════════════
+Tu único cometido es **este** negocio: productos y obras de madera/jardín indicados en la identidad y en [DATOS_SERVICIOS_FIRESTORE].
+No menciones carteras de propiedades, tasaciones, alquileres de vivienda, venta de departamentos/lotes, hipotecas, consorcios ni “agendar visita” para ver una casa en venta.
+Si el cliente mezcla temas inmobiliarios, respondé una sola vez aclarando el rubro de Gardens Wood y volvé al tema madera/jardín con una pregunta concreta (cantidad, medidas, zona).
 `;
 
 // ============================================================
@@ -4122,9 +4225,213 @@ const vickyGeminiTurnDeps = {
     docIdClienteFirestore,
     bloqueLecturaChatPrevio,
     primerNombreClienteDesdeHistorial,
+    digitosRemitenteChat,
     LIMITE_INDIVIDUAL_KG,
     fs,
 };
+
+/**
+ * WhatsApp cliente: audio/texto de bienvenida (si aplica) + presencia + Gemini.
+ * Unifica el camino inmediato y el flush tras debounce de textos.
+ */
+async function ejecutarPipelineBienvenidaYGeminiWhatsappCliente(opts) {
+    const {
+        remoteJid,
+        session,
+        telCliente,
+        text,
+        tieneImagen,
+        tieneAudio,
+        imagenBase64,
+        imagenMime,
+        audioClienteBase64,
+        audioClienteMime,
+        publicidadLead,
+        minutosDesdeUltimoMensaje,
+    } = opts;
+
+    const primerContacto = !session.audioIntroEnviado;
+    if (primerContacto) {
+        session.audioIntroEnviado = true;
+        marcarAudioEnviado(remoteJid);
+
+        console.log(`🎵 Enviando audio de bienvenida a ${remoteJid}`);
+        if (AUDIO_INTRO_EXISTS) {
+            try {
+                await sendBotMessage(remoteJid, {
+                    audio: fs.readFileSync(AUDIO_INTRO_PATH),
+                    mimetype: 'audio/mpeg',
+                    ptt: false
+                });
+                await delay(1500);
+            } catch (errAudio) {
+                console.error('❌ Error enviando audio:', errAudio.message);
+            }
+        }
+
+        const esTextoVago = !text || /^(hola|buenas|buen[ao]s?\s*(días?|tardes?|noches?)?|hey|hi|hello|saludos?|buenas?|ey|q tal|como andas?)\s*[!?¡¿.]*$/i.test(String(text).trim());
+        if (esTextoVago && !tieneImagen && !tieneAudio) {
+            await sendBotMessage(remoteJid, { text: vickyRuntimeCfg.mensajeBienvenidaActivo });
+            return;
+        }
+
+        const omitirTextoBienvenidaExtra = !!(publicidadLead && !esTextoVago);
+        if (!omitirTextoBienvenidaExtra) {
+            await sendBotMessage(remoteJid, { text: vickyRuntimeCfg.mensajeBienvenidaActivo });
+            await delay(1000);
+        }
+    }
+
+    if (!vickyGeminiModel) {
+        await sendBotMessage(remoteJid, {
+            text: `Disculpá, estoy teniendo un problema técnico en este momento. Volvé a escribirme en unos minutos 🙏`
+        });
+        return;
+    }
+
+    await simularEscrituraVicky(remoteJid);
+
+    if (session.humanAtendiendo && session.humanTimestamp
+        && Date.now() - session.humanTimestamp < vickyRuntimeCfg.SILENCIO_HUMANO_MS) {
+        console.log(`👤 Silencio humano (tras delay escritura) — sin Gemini ${remoteJid}`);
+        return;
+    }
+    if (firestoreModule.isAvailable()) {
+        const stPostDelay = await firestoreModule.getChatSilenceState(remoteJid, { bypassCache: true });
+        if (stPostDelay?.shouldSilence) {
+            session.humanAtendiendo = true;
+            session.humanTimestamp = Date.now();
+            console.log(`👤 Silencio Firestore (tras delay escritura) — sin Gemini ${remoteJid}`);
+            return;
+        }
+    }
+
+    await ejecutarTurnoVickyGeminiCore(vickyGeminiTurnDeps, {
+        canal: 'whatsapp',
+        remoteJid,
+        instagramPsid: null,
+        session,
+        telCliente,
+        text,
+        tieneImagen,
+        tieneAudio,
+        imagenBase64,
+        imagenMime,
+        audioClienteBase64,
+        audioClienteMime,
+        primerContacto,
+        minutosDesdeUltimoMensaje,
+        publicidadLead,
+    });
+}
+
+async function flushPendingWhatsappGeminiDebounced(remoteJid, snapshot) {
+    const texts = snapshot.parts.map(x => String(x.text || '').trim()).filter(Boolean);
+    if (!texts.length) return;
+    const merged = texts.length === 1
+        ? texts[0]
+        : `[El cliente mandó ${texts.length} mensajes seguidos en la misma ráfaga — respondé en un solo mensaje integrando toda la información, sin repetirte ni contradecirte.]\n`
+            + texts.map((t, i) => `${i + 1}) ${t}`).join('\n');
+    const publicidadLead = snapshot.parts.find(x => x.publicidadLead)?.publicidadLead || null;
+
+    if (/^(1|true|yes)$/i.test(String(process.env.VICKY_LOG_DEBOUNCE || '').trim())) {
+        console.log(`📎 [debounce] flush jid=${remoteJid} n=${texts.length} reason=batch`);
+    }
+
+    const session = SESSIONS.get(remoteJid);
+    if (!session) {
+        console.warn(`⚠️ Debounce flush sin sesión (${remoteJid})`);
+        return;
+    }
+    if (session.humanAtendiendo && session.humanTimestamp
+        && Date.now() - session.humanTimestamp < vickyRuntimeCfg.SILENCIO_HUMANO_MS) {
+        console.log(`👤 Debounce flush omitido (humano atendiendo) ${remoteJid}`);
+        return;
+    }
+    if (firestoreModule.isAvailable()) {
+        const liveActivo = await firestoreModule.getBotActivoLive();
+        vickyRuntimeCfg.BOT_ACTIVO = liveActivo;
+        if (!liveActivo) {
+            console.log(`🛑 Debounce flush: botActivo=false (${remoteJid})`);
+            return;
+        }
+        const silence = await firestoreModule.getChatSilenceState(remoteJid, { bypassCache: true });
+        if (silence?.shouldSilence) {
+            session.humanAtendiendo = true;
+            session.humanTimestamp = Date.now();
+            console.log(`🔇 Debounce flush omitido (chat silenciado) ${remoteJid}`);
+            return;
+        }
+    } else if (!vickyRuntimeCfg.BOT_ACTIVO) {
+        return;
+    }
+
+    const telCliente = getTel(remoteJid);
+    console.log(`📎 WhatsApp: ${texts.length} mensaje(s) de texto fusionados → un turno Gemini (${remoteJid})`);
+
+    await ejecutarPipelineBienvenidaYGeminiWhatsappCliente({
+        remoteJid,
+        session,
+        telCliente,
+        text: merged,
+        tieneImagen: false,
+        tieneAudio: false,
+        imagenBase64: null,
+        imagenMime: 'image/jpeg',
+        audioClienteBase64: null,
+        audioClienteMime: 'audio/ogg',
+        publicidadLead,
+        minutosDesdeUltimoMensaje: snapshot.retornoMinutos ?? null,
+    });
+}
+
+function limpiarTimersDebounceWhatsapp() {
+    for (const [, p] of waDebouncedGeminiByJid.entries()) {
+        if (p?.timer) clearTimeout(p.timer);
+    }
+    waDebouncedGeminiByJid.clear();
+}
+
+/**
+ * @param {{ text: string, publicidadLead?: object|null, retornoMinutos?: number|null }} part
+ */
+function scheduleWhatsappGeminiDebounce(remoteJid, part) {
+    let p = waDebouncedGeminiByJid.get(remoteJid);
+    const esNuevoBurst = !p || !p.parts.length;
+    if (!p) {
+        p = { timer: null, parts: [], retornoMinutos: null };
+        waDebouncedGeminiByJid.set(remoteJid, p);
+    }
+    if (esNuevoBurst) {
+        p.retornoMinutos = part.retornoMinutos ?? null;
+    }
+    if (p.timer) clearTimeout(p.timer);
+    p.parts.push({ text: part.text, publicidadLead: part.publicidadLead || null });
+
+    const maxP = vickyRuntimeCfg.DEBOUNCE_CHAT_MAX_PARTES || 3;
+    const ms = Number(vickyRuntimeCfg.DEBOUNCE_CHAT_MS) || 0;
+
+    if (p.parts.length >= maxP) {
+        if (p.timer) clearTimeout(p.timer);
+        waDebouncedGeminiByJid.delete(remoteJid);
+        void flushPendingWhatsappGeminiDebounced(remoteJid, p);
+        return;
+    }
+    if (ms <= 0) {
+        if (p.timer) clearTimeout(p.timer);
+        waDebouncedGeminiByJid.delete(remoteJid);
+        void flushPendingWhatsappGeminiDebounced(remoteJid, p);
+        return;
+    }
+
+    p.timer = setTimeout(() => {
+        const entry = waDebouncedGeminiByJid.get(remoteJid);
+        if (!entry) return;
+        if (entry.timer) clearTimeout(entry.timer);
+        waDebouncedGeminiByJid.delete(remoteJid);
+        void flushPendingWhatsappGeminiDebounced(remoteJid, entry);
+    }, ms);
+}
 
 async function procesarWebhookInstagramPayload(body) {
     if (!vickyBootstrapHecho) {
@@ -4147,8 +4454,14 @@ async function procesarMensajeInstagram(instagramPsid, text) {
     const textTrim = (text || '').trim();
     if (!textTrim) return;
 
+    // Prioridad sobre panel: `VICKY_INSTAGRAM_DM=0|false|no|off` → no responder por Instagram.
+    const igEnv = String(process.env.VICKY_INSTAGRAM_DM ?? '').trim();
+    if (/^(0|false|no|off)$/i.test(igEnv)) {
+        return;
+    }
+
     if (firestoreModule.isAvailable()) {
-        const silence = await firestoreModule.getChatSilenceState(remoteJid);
+        const silence = await firestoreModule.getChatSilenceState(remoteJid, { bypassCache: true });
         if (silence?.shouldSilence) {
             const s = SESSIONS.get(remoteJid);
             if (s) {
@@ -4156,6 +4469,11 @@ async function procesarMensajeInstagram(instagramPsid, text) {
                 s.humanTimestamp = Date.now();
             }
             return;
+        }
+        const sAlinear = SESSIONS.get(remoteJid);
+        if (sAlinear) {
+            sAlinear.humanAtendiendo = false;
+            sAlinear.humanTimestamp = null;
         }
     }
 
@@ -4253,6 +4571,76 @@ async function procesarMensajeInstagram(instagramPsid, text) {
     actualizarEstadoCliente(remoteJid, { ultimoMensaje: ahora });
     session.mensajesTexto = (session.mensajesTexto || 0) + 1;
 
+    const telCliente = getTel(remoteJid);
+    let cgIg = null;
+    if (firestoreModule.isAvailable() && typeof firestoreModule.getConfigGeneral === 'function') {
+        try {
+            cgIg = await firestoreModule.getConfigGeneral({ bypassCache: true });
+        } catch (_) {
+            cgIg = null;
+        }
+    }
+    const instagramSoloWhatsapp = !cgIg || cgIg.instagramDmSoloEnlaceWhatsapp !== false;
+
+    if (instagramSoloWhatsapp) {
+        const waitShort = 1500 + Math.floor(Math.random() * 1500);
+        await delay(waitShort);
+
+        if (session.humanAtendiendo && session.humanTimestamp
+            && Date.now() - session.humanTimestamp < vickyRuntimeCfg.SILENCIO_HUMANO_MS) {
+            console.log(`👤 Silencio humano (IG, tras delay) — sin respuesta ${remoteJid}`);
+            return;
+        }
+        if (firestoreModule.isAvailable()) {
+            const stPostDelay = await firestoreModule.getChatSilenceState(remoteJid, { bypassCache: true });
+            if (stPostDelay?.shouldSilence) {
+                session.humanAtendiendo = true;
+                session.humanTimestamp = Date.now();
+                console.log(`👤 Silencio Firestore (IG, tras delay) — sin respuesta ${remoteJid}`);
+                return;
+            }
+        }
+
+        const digitsWa = resolverDigitosEnlaceWhatsappCliente(cgIg || {});
+        const textoSoloWa = construirMensajeInstagramSoloWhatsapp(
+            digitsWa,
+            cgIg?.instagramDmMensajeEnlaceWhatsapp
+        );
+        if (!session.audioIntroEnviado) {
+            session.audioIntroEnviado = true;
+            marcarAudioEnviado(remoteJid);
+        }
+        try {
+            await instagramDmMod.enviarDmInstagram(instagramPsid, textoSoloWa);
+        } catch (e) {
+            console.error('❌ Instagram solo WhatsApp:', e.message);
+            return;
+        }
+        const histDesp = getCliente(remoteJid);
+        firestoreModule
+            .logMensaje({
+                jid: remoteJid,
+                tipo: 'texto',
+                contenido: textoSoloWa,
+                direccion: 'saliente',
+                servicio: histDesp?.servicioPendiente || null,
+                clienteInfo: {
+                    nombre: histDesp?.nombre,
+                    estado: histDesp?.estado,
+                    servicioPendiente: histDesp?.servicioPendiente,
+                },
+            })
+            .catch(() => {});
+        const salidaHc = limpiarTextoParaHistorialConsulta(textoSoloWa);
+        appendHistorialConsultaSync(telCliente, {
+            entradaCliente: textTrim.slice(0, 2500),
+            salidaVicky: salidaHc,
+            nombre: histDesp?.nombre || null,
+        });
+        console.log(`📸 Instagram DM → solo enlace WhatsApp (${digitsWa ? `${digitsWa.slice(0, 4)}…` : 'sin dígitos'}) ${remoteJid}`);
+        return;
+    }
+
     const primerContacto = !session.audioIntroEnviado;
     if (primerContacto) {
         session.audioIntroEnviado = true;
@@ -4290,11 +4678,27 @@ async function procesarMensajeInstagram(instagramPsid, text) {
         return;
     }
 
-    const delayIgMin = Math.max(2, Math.floor(vickyRuntimeCfg.DELAY_MIN / 1000 / 4));
-    const delayIgMax = Math.max(delayIgMin + 1, Math.floor(vickyRuntimeCfg.DELAY_MAX / 1000 / 4));
-    await delay((delayIgMin + Math.random() * (delayIgMax - delayIgMin)) * 1000);
+    // Mismo rango de espera que WhatsApp (`delayMinSeg` / `delayMaxSeg` en panel); IG no tiene presencia "composing".
+    const { DELAY_MIN, DELAY_MAX } = vickyRuntimeCfg;
+    const spanIg = DELAY_MAX - DELAY_MIN;
+    const waitIgMs = spanIg <= 0 ? DELAY_MIN : DELAY_MIN + Math.floor(Math.random() * (spanIg + 1));
+    await delay(waitIgMs);
 
-    const telCliente = getTel(remoteJid);
+    if (session.humanAtendiendo && session.humanTimestamp
+        && Date.now() - session.humanTimestamp < vickyRuntimeCfg.SILENCIO_HUMANO_MS) {
+        console.log(`👤 Silencio humano (IG, tras delay) — sin Gemini ${remoteJid}`);
+        return;
+    }
+    if (firestoreModule.isAvailable()) {
+        const stPostDelay = await firestoreModule.getChatSilenceState(remoteJid, { bypassCache: true });
+        if (stPostDelay?.shouldSilence) {
+            session.humanAtendiendo = true;
+            session.humanTimestamp = Date.now();
+            console.log(`👤 Silencio Firestore (IG, tras delay) — sin Gemini ${remoteJid}`);
+            return;
+        }
+    }
+
     await ejecutarTurnoVickyGeminiCore(vickyGeminiTurnDeps, {
         canal: 'instagram',
         remoteJid,
@@ -4686,6 +5090,7 @@ async function recargarVickyGeminiSystemPrompt() {
         full += SYSTEM_PROMPT_SUFIJO_UBICACION_MARCADORES;
         full += SYSTEM_PROMPT_SUFIJO_NOMBRE_SALUDO;
         full += SYSTEM_PROMPT_SUFIJO_COLA_LENA;
+        full += SYSTEM_PROMPT_SUFIJO_EXCLUSION_INMO_OTROS;
         vickyGeminiModel = vickyGoogleGenAI.getGenerativeModel({
             model: modelo,
             systemInstruction: full,
@@ -4728,6 +5133,7 @@ async function connectToWhatsApp(isReconnect = false) {
         SYSTEM_PROMPT_ACTIVO += SYSTEM_PROMPT_SUFIJO_UBICACION_MARCADORES;
         SYSTEM_PROMPT_ACTIVO += SYSTEM_PROMPT_SUFIJO_NOMBRE_SALUDO;
         SYSTEM_PROMPT_ACTIVO += SYSTEM_PROMPT_SUFIJO_COLA_LENA;
+        SYSTEM_PROMPT_ACTIVO += SYSTEM_PROMPT_SUFIJO_EXCLUSION_INMO_OTROS;
 
     const TEXTO_AYUDA_BIENVENIDA_DEFAULT = '¿En qué te puedo ayudar? Escribime porfa que me es más fácil responder 😊';
         vickyRuntimeCfg.mensajeBienvenidaActivo = await firestoreModule.getMensajeBienvenidaTexto(TEXTO_AYUDA_BIENVENIDA_DEFAULT);
@@ -4740,6 +5146,25 @@ async function connectToWhatsApp(isReconnect = false) {
         if (maxEscS < minEscS + 2) maxEscS = minEscS + 8;
         vickyRuntimeCfg.DELAY_MIN = minEscS * 1000;
         vickyRuntimeCfg.DELAY_MAX = maxEscS * 1000;
+
+        const debMsEnv = parseInt(String(process.env.VICKY_CHAT_DEBOUNCE_MS || '').trim(), 10);
+        if (Number.isFinite(debMsEnv) && debMsEnv >= 0) {
+            vickyRuntimeCfg.DEBOUNCE_CHAT_MS = debMsEnv === 0 ? 0 : Math.min(120000, Math.max(400, debMsEnv));
+        } else {
+            const debSec = Number(configGeneral.debounceChatSeg);
+            const sec = Number.isFinite(debSec) ? debSec : 3;
+            vickyRuntimeCfg.DEBOUNCE_CHAT_MS = sec <= 0 ? 0 : Math.round(Math.min(60, Math.max(0.8, sec)) * 1000);
+        }
+        const debMaxEnv = parseInt(String(process.env.VICKY_CHAT_DEBOUNCE_MAX_PARTES || '').trim(), 10);
+        const debMaxRaw = parseInt(String(configGeneral.debounceChatMaxMensajes ?? '').trim(), 10);
+        const dm = Number.isFinite(debMaxEnv) ? debMaxEnv : (Number.isFinite(debMaxRaw) ? debMaxRaw : 3);
+        vickyRuntimeCfg.DEBOUNCE_CHAT_MAX_PARTES = Math.min(15, Math.max(2, dm));
+        if (vickyRuntimeCfg.DEBOUNCE_CHAT_MS > 0) {
+            console.log(
+                `⏳ WhatsApp debounce: ${vickyRuntimeCfg.DEBOUNCE_CHAT_MS} ms tras último texto; tope ${vickyRuntimeCfg.DEBOUNCE_CHAT_MAX_PARTES} mensajes → 1 respuesta`
+            );
+        }
+
     const MODELO_GEMINI = String(process.env.GEMINI_MODEL || '').trim()
         || String(configGeneral.modeloGemini || '').trim()
         || VICKY_GEMINI_MODEL_DEFAULT;
@@ -4801,6 +5226,13 @@ async function connectToWhatsApp(isReconnect = false) {
         vickyRuntimeCfg.CAMPANA_DESC_PCT = Number.isFinite(Number(configGeneral.campanaDescuentoPct))
             ? Number(configGeneral.campanaDescuentoPct)
             : 10;
+
+        const igSoloWa = configGeneral.instagramDmSoloEnlaceWhatsapp !== false;
+        console.log(
+            igSoloWa
+                ? '📸 Instagram DM: modo solo enlace WhatsApp (sin Gemini).'
+                : '📸 Instagram DM: modo IA (Gemini).'
+        );
 
     if (GEMINI_API_KEY) {
             const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
@@ -5039,6 +5471,7 @@ async function connectToWhatsApp(isReconnect = false) {
             qrImage.image(qr, { type: 'png', size: 4 }).pipe(fs.createWriteStream('qr.png'));
         }
         if (connection === 'close') {
+            limpiarTimersDebounceWhatsapp();
             if (agendaGrupoNotifyInterval) {
                 clearInterval(agendaGrupoNotifyInterval);
                 agendaGrupoNotifyInterval = null;
@@ -5123,6 +5556,12 @@ async function connectToWhatsApp(isReconnect = false) {
             if (remoteJid.endsWith('@g.us')) return;
             if (remoteJid === 'status@broadcast') return;
 
+            // Dedupe entrante antes de cualquier await (bloque admin incluye awaits; si no, dos upsert
+            // del mismo mensaje pueden pasar el chequeo y disparar dos respuestas Gemini).
+            if (dedupeIncomingClienteMsgSync(msg)) {
+                return;
+            }
+
             // --- MODO ADMIN: dueño desde otro celular (!fromMe) o desde la misma cuenta Business (fromMe en chat elegido) ---
             const textoRaw = textoAdminDesdeTextoPlano(extraerTextoParaAdmin(msg));
                 const tieneAudioMsg = !!(msg.message?.audioMessage || msg.message?.pttMessage);
@@ -5202,7 +5641,7 @@ async function connectToWhatsApp(isReconnect = false) {
                     await sendBotMessage(remoteJid, {
                         text: '🔐 Comando de administración no habilitado en este chat.\n\n'
                             + '• Frase secreta (ADMIN_SECRET) y *después* el comando.\n'
-                            + '• Comandos: *#g* / *!!g* / *vicky:g* (instructivo Gemini), *#c* / *!!c* (puente cliente), *#entrega* / *!!entrega* (cargar agenda con *#c* o JID; *#entrega lista* / *lista todas* para ver próximos eventos), *#final_entrega* / *!!final_entrega* (cierre datos de entrega tras humano), *#cola_lena* / *!!cola_lena* (cola leña: *#cola_lena* + tel o solo con *#c* al cliente; sin puente, *#cola_lena* solo = ayuda), *#reporte* + *detalle …*, *#p* (*lista* / *lidmap* / *tel* / *+tel* / *-tel* / *N*), *#pedido* …, *#ruta* / *!!ruta*, *#ruta_geo* / *!!ruta_geo* (campaña por polilínea en panel), *#enviar …*, *#estado* / *!!estado*, *#silencio global* / *#activo global* / *#activo parcial*, *#silenciar …* / *!!silenciar …* / *#activar …*…\n'
+                            + '• Comandos: *#g* / *!!g* / *vicky:g* (instructivo Gemini), *#c* / *!!c* (puente cliente), *#kp* / *!!kp* (Kontrolpro / Supabase: gastos, notas, cheques, listados), *#entrega* / *!!entrega* (cargar agenda con *#c* o JID; *#entrega lista* / *lista todas* para ver próximos eventos), *#final_entrega* / *!!final_entrega* (cierre datos de entrega tras humano), *#cola_lena* / *!!cola_lena* (cola leña: *#cola_lena* + tel o solo con *#c* al cliente; sin puente, *#cola_lena* solo = ayuda), *#reporte* + *detalle …*, *#p* (*lista* / *lidmap* / *tel* / *+tel* / *-tel* / *N*), *#pedido* …, *#ruta* / *!!ruta*, *#ruta_geo* / *!!ruta_geo* (campaña por polilínea en panel), *#enviar …*, *#estado* / *!!estado*, *#silencio global* / *#activo global* / *#activo parcial*, *#silenciar …* / *!!silenciar …* / *#activar …*…\n'
                             + '• *Teléfono admin* en panel + *ADMIN_PHONE* en servidor si querés sin frase secreta.\n\n'
                             + '_La sesión admin se guarda en Firestore (varias réplicas Cloud Run)._'
                     });
@@ -5217,12 +5656,19 @@ async function connectToWhatsApp(isReconnect = false) {
                         const soloOpcionMenuNum = /^[1-4]\s*$/i.test(colaSecreta);
                         const soloMenuKeyword = /^menu$/i.test(colaSecreta);
                         const soloMenuTrasSecreta = soloOpcionMenuNum || soloMenuKeyword;
-                        const preservarWizardAgenda =
+                        const tipoW = existing.wizard && existing.wizard.tipo;
+                        const preservarWizardKontrolpro =
                             existing.wizard &&
-                            existing.wizard.tipo === 'agenda_entrega' &&
+                            typeof tipoW === 'string' &&
+                            tipoW.startsWith('kontrolpro_') &&
                             colaSecreta &&
                             !soloMenuTrasSecreta;
-                        const wizardSiguiente = preservarWizardAgenda
+                        const preservarWizardAgenda =
+                            existing.wizard &&
+                            tipoW === 'agenda_entrega' &&
+                            colaSecreta &&
+                            !soloMenuTrasSecreta;
+                        const wizardSiguiente = preservarWizardAgenda || preservarWizardKontrolpro
                             ? JSON.parse(JSON.stringify(existing.wizard))
                             : null;
                         adminSesionesActivas.set(remoteJid, {
@@ -5303,6 +5749,23 @@ async function connectToWhatsApp(isReconnect = false) {
                             limpiarCapturasGemini,
                         })
                     ) {
+                        return;
+                    }
+
+                    // ── Kontrolpro (#kp): wizard o comando raíz
+                    const kpCtx = {
+                        remoteJid,
+                        sesion,
+                        tAdm,
+                        tieneAudioMsg,
+                        sendBotMessage,
+                        persistAdminWaSessionFirestore,
+                        adminMenuPrincipalMsg: ADMIN_MENU_PRINCIPAL_MSG,
+                    };
+                    if (await kontrolproAdmin.handleKontrolproWizard(kpCtx)) {
+                        return;
+                    }
+                    if (await kontrolproAdmin.handleKontrolproRootCommand(kpCtx)) {
                         return;
                     }
 
@@ -5606,7 +6069,7 @@ async function connectToWhatsApp(isReconnect = false) {
                             await sendBotMessage(remoteJid, {
                                 text:
                                     '⚙️ *Más comandos*\n\n'
-                                    + 'Podés escribirlos directo: *#reporte*, *#p lista*, *#c*, *#ruta*, *#entrega*, *#final_entrega*, *#cola_lena*, *#g*, *#enviar* …\n\n'
+                                    + 'Podés escribirlos directo: *#reporte*, *#kp*, *#p lista*, *#c*, *#ruta*, *#entrega*, *#final_entrega*, *#cola_lena*, *#g*, *#enviar* …\n\n'
                                     + '_*menu*_ — volver al menú numerado._',
                             });
                             persistAdminWaSessionFirestore(remoteJid).catch(() => {});
@@ -6724,7 +7187,7 @@ async function connectToWhatsApp(isReconnect = false) {
 
                     // Modo puente: reenviar al cliente (Gemini) salvo comandos # explícitos
                     if (sesion?.modoBridge && sesion.bridgeTarget && (tieneAudioMsg || tAdm)) {
-                        const esComandoHash = /^#\s*(g|ruta|c|reporte|salir|enviar|silencio|silenciar|activar|activo|vicky|entrega|final_entrega|cola_lena)\b/i.test(tAdm)
+                        const esComandoHash = /^#\s*(g|ruta|c|kp|kontrol|reporte|salir|enviar|silencio|silenciar|activar|activo|vicky|entrega|final_entrega|cola_lena)\b/i.test(tAdm)
                             || /^#\s*estado\s*$/i.test(tAdm);
                         if (tieneAudioMsg || (tAdm && !esComandoHash)) {
                             let audioB64 = null;
@@ -6959,19 +7422,11 @@ Ejemplos de cómo traducir instrucciones:
                 }
             }
 
-            // --- DEDUPE: evitar procesar el mismo mensaje entrante 2 veces ---
-            if (!msg.key.fromMe && msg.key.id) {
-                if (wasIncomingProcessed(msg.key.id)) {
-                    return;
-                }
-                markIncomingProcessed(msg.key.id);
-            }
-
             // --- SILENCIO REAL (panel / Firestore) ---
             // Si un operador silenció el chat desde el dashboard, el bot no debe contestar,
             // ni enviar audio de bienvenida, ni continuar el flujo normal.
             if (!msg.key.fromMe && firestoreModule.isAvailable()) {
-                const silence = await firestoreModule.getChatSilenceState(remoteJid);
+                const silence = await firestoreModule.getChatSilenceState(remoteJid, { bypassCache: true });
                 if (silence?.shouldSilence) {
                     // Mantener también la sesión local en modo humano para cortar rápido
                     const s = SESSIONS.get(remoteJid);
@@ -7067,15 +7522,19 @@ Ejemplos de cómo traducir instrucciones:
 
             // --- DETECCIÓN DE HUMANO ATENDIENDO ---
             if (msg.key.fromMe) {
-                const tsOut = lastBotOutTsByJid.get(remoteJid);
-                const ecoBotReciente = tsOut != null && Date.now() - tsOut < BOT_OUT_GRACE_MS;
-                if (!BOT_MSG_IDS.has(msg.key.id) && !ecoBotReciente) {
+                if (BOT_MSG_IDS.has(msg.key.id)) {
+                    // Eco del propio envío de Vicky (mismo id que devolvió sendMessage)
+                } else {
                     session.humanAtendiendo = true;
                     session.humanTimestamp = Date.now();
                     console.log(`👤 Humano respondió en ${remoteJid}. Bot silenciado 24hs.`);
-                    firestoreModule.setHumanoAtendiendo(remoteJid, true).catch(() => {});
-                } else if (ecoBotReciente && !BOT_MSG_IDS.has(msg.key.id)) {
-                    console.log(`🤖 Eco saliente ignorado (no marcar humano) — ${remoteJid}`);
+                    if (firestoreModule.isAvailable()) {
+                        try {
+                            await firestoreModule.setHumanoAtendiendo(remoteJid, true);
+                        } catch (e) {
+                            console.warn('⚠️ setHumanoAtendiendo:', e.message);
+                        }
+                    }
                 }
                 return;
             }
@@ -7191,60 +7650,32 @@ Ejemplos de cómo traducir instrucciones:
                 }
             }
 
-            // --- AUDIO DE BIENVENIDA (solo la primera vez por cliente, para siempre) ---
-            // primerMensajeConContenido: si el cliente ya incluyó info en su primer mensaje,
-            // NO cortamos con return — dejamos que Gemini responda a lo que preguntó.
-            const primerContacto = !session.audioIntroEnviado;
-            if (primerContacto) {
-                session.audioIntroEnviado = true;
-                marcarAudioEnviado(remoteJid);
-
-                console.log(`🎵 Enviando audio de bienvenida a ${remoteJid}`);
-                if (AUDIO_INTRO_EXISTS) {
-                    try {
-                        await sendBotMessage(remoteJid, {
-                            audio: fs.readFileSync(AUDIO_INTRO_PATH),
-                            mimetype: 'audio/mpeg',
-                            ptt: false
-                        });
-                        await delay(1500);
-                    } catch (errAudio) {
-                        console.error('❌ Error enviando audio:', errAudio.message);
-                    }
+            // Imagen o audio: vaciar buffer de textos pendientes y procesar en orden (texto fusionado primero).
+            if (tieneImagen || tieneAudio) {
+                const pend = waDebouncedGeminiByJid.get(remoteJid);
+                if (pend?.parts?.length) {
+                    if (pend.timer) clearTimeout(pend.timer);
+                    waDebouncedGeminiByJid.delete(remoteJid);
+                    await flushPendingWhatsappGeminiDebounced(remoteJid, pend);
                 }
-
-                // Si el primer mensaje solo es un saludo vacío (sin contenido relevante),
-                // enviamos el mensaje de bienvenida y esperamos su respuesta.
-                const esTextoVago = !text || /^(hola|buenas|buen[ao]s?\s*(días?|tardes?|noches?)?|hey|hi|hello|saludos?|buenas?|ey|q tal|como andas?)\s*[!?¡¿.]*$/i.test(text.trim());
-                if (esTextoVago && !tieneImagen && !tieneAudio) {
-                    await sendBotMessage(remoteJid, { text: vickyRuntimeCfg.mensajeBienvenidaActivo });
-                    return;
-                }
-
-                // Si ya trajo consulta concreta y viene de publicidad, no repetimos el texto fijo (solo audio + Gemini).
-                const omitirTextoBienvenidaExtra = !!(publicidadLead && !esTextoVago);
-                if (!omitirTextoBienvenidaExtra) {
-                    await sendBotMessage(remoteJid, { text: vickyRuntimeCfg.mensajeBienvenidaActivo });
-                    await delay(1000);
-                }
-                // Caemos al bloque de Gemini con contexto especial de que es el primer mensaje.
             }
 
-            // --- CONSULTAR GEMINI ---
-            if (!vickyGeminiModel) {
-                await sendBotMessage(remoteJid, {
-                    text: `Disculpá, estoy teniendo un problema técnico en este momento. Volvé a escribirme en unos minutos 🙏`
+            const debounceTextoSolo =
+                !tieneImagen
+                && !tieneAudio
+                && !!text
+                && (Number(vickyRuntimeCfg.DEBOUNCE_CHAT_MS) > 0);
+            if (debounceTextoSolo) {
+                scheduleWhatsappGeminiDebounce(remoteJid, {
+                    text,
+                    publicidadLead,
+                    retornoMinutos: minutosDesdeUltimoMensaje,
                 });
                 return;
             }
 
-            // Primero todo el tiempo de "escribiendo…", después se llama a Gemini (más lento y natural).
-            await simularEscrituraVicky(remoteJid);
-
-            await ejecutarTurnoVickyGeminiCore(vickyGeminiTurnDeps, {
-                canal: 'whatsapp',
-                            remoteJid,
-                instagramPsid: null,
+            await ejecutarPipelineBienvenidaYGeminiWhatsappCliente({
+                remoteJid,
                 session,
                 telCliente,
                 text,
@@ -7254,9 +7685,8 @@ Ejemplos de cómo traducir instrucciones:
                 imagenMime,
                 audioClienteBase64,
                 audioClienteMime,
-                primerContacto,
-                minutosDesdeUltimoMensaje,
                 publicidadLead,
+                minutosDesdeUltimoMensaje,
             });
 
         } catch (globalError) {
