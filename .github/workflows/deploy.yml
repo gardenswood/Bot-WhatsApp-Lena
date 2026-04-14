@@ -13,6 +13,10 @@ on:
       - '.github/workflows/**'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   deploy:
     name: Build & Deploy Bot
@@ -22,10 +26,11 @@ jobs:
       - name: Checkout código
         uses: actions/checkout@v4
 
-      - name: Autenticar con Google Cloud
+      - name: Autenticar con Google Cloud (WIF / OIDC)
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud CLI
         uses: google-github-actions/setup-gcloud@v2
