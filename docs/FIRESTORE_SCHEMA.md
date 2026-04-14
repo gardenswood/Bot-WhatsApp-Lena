@@ -10,7 +10,7 @@ Operación del panel, redeploy y recuperación de prompts: [`CONFIGURACION_PANEL
 
 | Documento | Campos principales | Escritura | Lectura bot |
 |-----------|-------------------|-----------|-------------|
-| `general` | `delayMinSeg`, `delayMaxSeg`, `modeloGemini`, `frecuenciaAudioFidelizacion`, `tiempoSilencioHumanoHoras`, `botActivo`, **`instagramDmActivo`**, `adminPhone`, **`datosEntregaNotifyPhone`**, horarios atención, `whatsappLabelIdContactarAsesor`, campañas (`campanaDelayMinSeg`, `campanaDelayMaxSeg`, `campanaMaxDestinatarios`, `campanaDescuentoPct`, `campanaRutaFechaTexto`, `campanaRutaPlantilla`), **`geocodeCronActivo`**, **`geocodeCronMaxPorEjecucion`**, **`whatsappGrupoJidAgendaEntregas`** (JID `…@g.us` — aviso al grupo al crear `entregas_agenda`), **`notificarAgendaEntregasGrupoActivo`** (default true) | Panel → General | Cache ~5 min en la mayoría de campos; **`whatsappGrupoJidAgendaEntregas`** / toggle agenda se leen **sin caché** en cada aviso al grupo (evita JID vacío tras guardar en panel). Hook + sondeo ~50 s |
+| `general` | `delayMinSeg`, `delayMaxSeg`, `modeloGemini`, `frecuenciaAudioFidelizacion`, `tiempoSilencioHumanoHoras`, `botActivo`, **`instagramDmActivo`**, `adminPhone`, **`datosEntregaNotifyPhone`**, horarios atención, `whatsappLabelIdContactarAsesor`, campañas (`campanaDelayMinSeg`, `campanaDelayMaxSeg`, `campanaMaxDestinatarios`, `campanaDescuentoPct`, `campanaRutaFechaTexto`, `campanaRutaPlantilla`), **`geocodeCronActivo`**, **`geocodeCronMaxPorEjecucion`**, **`whatsappGrupoJidAgendaEntregas`**, **`notificarAgendaEntregasGrupoActivo`**, **`colaLenaCapacidadCamionKg`** (default 1000 — barra del panel cola leña), **`colaLenaUmbralDisparoRutaKg`** (default igual a capacidad: al alcanzar esa suma de kg `en_cola`, el bot arma ruta con **Google Directions `optimize:true`** o vecino más cercano y avisa al admin) | Panel → General | Cache ~5 min en la mayoría de campos; **`whatsappGrupoJidAgendaEntregas`** / toggle agenda se leen **sin caché** en cada aviso al grupo (evita JID vacío tras guardar en panel). Hook + sondeo ~50 s |
 | `prompts` | `sistemaPrompt`, `sistemaPromptAdmin`, `mensajeBienvenidaTexto`, **`mensajeClienteCierreEntregaHumano`** (WhatsApp al cliente al disparar admin `#final_entrega`), **`instruccionCierreEntregaHumanoGemini`** (bloque extra al modelo mientras `chats/{jid}.cierreEntregaAsistido`) | Panel → Instrucciones AI | Al armar Gemini, el bot **anteponde** (código) el bloque fijo *IDENTIDAD GARDENS WOOD* y luego `sistemaPrompt` (o fallback `SYSTEM_PROMPT` en `bot.js`). Después: bloque servicios + `SYSTEM_PROMPT_SUFIJO_*` (ubicación, nombre, cola leña). Mantener `sistemaPrompt` alineado solo a Gardens Wood (no mezclar otro negocio). |
 
 **Subcolección** `config/prompts/versiones/{id}` — historial de versiones del prompt (panel).
@@ -156,15 +156,18 @@ Pedidos pequeños de leña (≤200 kg por marcador); **fuente operativa del bot*
 | `id` (doc) | string | Estable: `cola_{dígitosWhatsApp}` (mismo criterio que el tel en JID, sin `@s.whatsapp.net`). |
 | `remoteJid` | string | JID WhatsApp del cliente. |
 | `nombre`, `direccion`, `zona` | string | CRM / cola. |
-| `cantidadKg` | number | Kg del pedido en cola. Puede ser **0** (pendiente) en alta manual `#cola_lena` solo con tel/CRM sin kg en historial; no suma al umbral de ruta hasta actualizar. |
+| `cantidadKg` | number | Kg del pedido en cola. Puede ser **0** (pendiente) en alta manual `#cola_lena` solo con tel/CRM sin kg en historial; no suma al umbral hasta actualizar. El umbral de disparo de ruta es **`config/general.colaLenaUmbralDisparoRutaKg`** (default 1000). |
+| `lat`, `lng` | number (opcional) | Copia de coordenadas de `clientes/{tel}` al armar la ruta (optimización); el mapa logístico puede usarlos si el panel los muestra. |
 | `tipoLena` | string (opcional) | `hogar`, `salamandra` o `parrilla` si Gemini emitió `[PEDIDO_LENA:kg\|dir\|tipo]`. |
 | `tel` | string (opcional) | Dígitos para búsqueda y display en panel. |
 | `fechaPedido` | Timestamp | En Firestore; en GCS el JSON puede llevar ISO string. |
 | `estado` | string | `en_cola` → `notificado` → `entregado` (panel puede actualizar estado). |
-| `ordenRuta` | number (opcional) | 1…N cuando el bot alcanzó el umbral de kg y calculó la ruta; **no** aplica en `en_cola` (el sync del bot borra estos campos en Firestore para ítems en cola). |
+| `ordenRuta` | number (opcional) | 1…N cuando el bot alcanzó el umbral de kg y optimizó el orden (**Directions `optimize:true`** o vecino más cercano); **no** aplica en `en_cola` (el sync del bot borra estos campos en Firestore para ítems en cola). |
 | `rutaGrupoId` | string (opcional) | Identificador del lote al disparar la ruta (ej. `rg_{timestamp}`). |
 
 **Escritura bot:** `syncColaLena` en lotes (≤400 docs por tanda), `merge: true`. No borra documentos de clientes que ya no están en el array en memoria (solo actualiza el snapshot enviado). Tras cada cambio de cola: GCS + sync; al conectar/reconectar WhatsApp, si hay pedidos, se vuelve a sincronizar.
+
+**Disparo “zona cercana” (`config/general`):** con `colaLenaUmbralClusterZonaKg` (ej. 800) y prefijo común entre el primer token de `zona` o `dirección` de cada pedido (`colaLenaClusterZonaMinPrefijo`, default 6), el bot arma ruta aunque no se haya llegado a `colaLenaUmbralDisparoRutaKg`. Poné **`colaLenaUmbralClusterZonaKg: 0`** para desactivar. Tras armar la ruta: plantilla `colaLenaPlantillaWAClienteRutaArmada` a cada cliente (`{nombre}`, `{zona}`, `{kg}`), aviso al admin y copia opcional a `colaLenaTelefonoAvisoRutaCopia` (solo dígitos, ej. Juan).
 
 ### `adminWaSesion/{docId}`
 
@@ -177,7 +180,7 @@ Sesión del **modo admin por WhatsApp** (frase secreta, `#g`, puente `#c`, borra
 | `listaClientes` | mapa `{ "1": "jid", … }` para atajos numéricos. |
 | `destinatarioPendiente` | `null` o `{ jid, etiqueta }` (flujo dos pasos). |
 | `modoBridge`, `bridgeTarget`, `esperandoSelectorPuente` | Estado puente / lista (sí se replica). |
-| `ultimoReporteIndice`, `ultimoReporteAt` | Tras *#reporte*: agregados para interpretar *detalle caliente*, *detalle estado X*, *detalle servicio Y*, *detalle log*. |
+| `ultimoReporteIndice`, `ultimoReporteAt` | Tras *#reporte*: agregados para interpretar *detalle caliente*, *detalle estado X*, *detalle servicio Y*, *detalle log*, *detalle mensajes hoy* (también funciona sin índice previo). |
 | `pListaIndex` | Cache de ítems para *#p lista* (sí se replica). |
 | `esperandoMenuPrincipal` | Tras la frase secreta **sin** texto cola: menú numerado hasta elegir 1–4 o un comando con *#*. |
 | `wizard` | Asistente por pasos (ej. `tipo: agenda_entrega`, `paso: tel \| detalle \| confirmar`, `jid`, fechas); se replica entre réplicas. |
@@ -187,7 +190,7 @@ Sesión del **modo admin por WhatsApp** (frase secreta, `#g`, puente `#c`, borra
 
 ### `mensajes_log/{autoId}`
 
-Log agregado para métricas (dashboard home). Campos: `jid`, `tipo`, `dirección`, `servicio`, `timestamp`.
+Log agregado para métricas (dashboard home y **#reporte** / *detalle mensajes hoy* en admin WhatsApp). Campos: `jid`, `tipo`, `direccion` (`entrante` \| `saliente`), `servicio` (copia de `servicioPendiente` del chat al loguear — agrupa “por servicio” el volumen del día), `timestamp`. Consulta día civil **America/Argentina/Cordoba** con rango `timestamp` (índice simple en `timestamp`).
 
 ### `usuarios/{uid}`
 

@@ -1730,7 +1730,7 @@ const ADMIN_MENU_PRINCIPAL_MSG =
     + '*1* — Enviar mensaje a un cliente (Vicky redacta con Gemini y lo envía)\n'
     + '*2* — Instructivo para Vicky (como *#g*: se suma al system prompt con *OK*)\n'
     + '*3* — Cargar *Agenda de entregas* (cliente → fecha → hora → título)\n'
-    + '*4* — Más comandos (*#reporte*, *#kp* Kontrolpro, *#p*, *#c*, *#ruta* …) — también podés escribirlos con *#* al inicio\n\n'
+    + '*4* — Más comandos (*#reporte* incluye mensajes del día por servicio, *#kp*, *#p*, *#c*, *#ruta* …) — también podés escribirlos con *#* al inicio\n\n'
     + '_Volver a este menú:_ *menu*\n'
     + '_Salir:_ *adminoff* o *#SALIR*';
 
@@ -1940,7 +1940,12 @@ function reactivarVickyTrasSalirAdmin(remoteJid) {
 // Mapeo @lid → teléfono real, construido desde contactos sincronizados por Baileys
 // Claves: lid numérico (sin @lid). Valores: teléfono (sin @s.whatsapp.net)
 const lidToPhone = new Map();
-const UMBRAL_COLA_KG = 500; // Total acumulado en cola para disparar notificación al admin
+/** Defaults si no hay `config/general` en Firestore (panel / operación). */
+const COLA_LENA_DEFAULTS = {
+    capacidadCamionKg: 1000,
+    /** Al alcanzar esta suma de kg en `en_cola` se arma ruta (por defecto = camión lleno). */
+    umbralDisparoRutaKg: 1000,
+};
 const LIMITE_INDIVIDUAL_KG = 200; // Pedidos > 200kg se entregan individual, ≤ 200kg van a cola grupal
 
 // --- ELEVENLABS TTS ---
@@ -1950,6 +1955,8 @@ const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID || 'agent_6101kmm5sc
 const ELEVENLABS_PHONE_NUMBER_ID = process.env.ELEVENLABS_PHONE_NUMBER_ID || 'phnum_9501kmmbjr2cfyj8r9cbwnr9b7g3';
 console.log(`🎙️ ElevenLabs: ${ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID ? '✅ configurado' : '❌ no configurado'}`);
 const BASE_LOCATION = 'Villa Allende, Córdoba, Argentina';
+/** Referencia para vecino más cercano (fallback sin Directions). */
+const BASE_LOCATION_LATLNG = { lat: -31.299, lng: -64.295 };
 
 let colaLena = [];
 
@@ -2020,13 +2027,301 @@ function totalKgEnCola() {
     return colaLena.filter(p => p.estado === 'en_cola').reduce((sum, p) => sum + (p.cantidadKg || 0), 0);
 }
 
-async function calcularRutaOptima(pedidos) {
+function normalizarTextoZonaCola(s) {
+    return String(s || '')
+        .trim()
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/\p{M}/gu, '')
+        .replace(/\s+/g, ' ')
+        .replace(/^(la|el|los|las)\s+/g, '');
+}
+
+/** Primer token de zona o dirección para agrupar corredores (ej. Mendiola / Mendiolaza). */
+function tokenZonaClusterCola(pedido) {
+    const z = String(pedido?.zona || '').trim();
+    const d = String(pedido?.direccion || '').trim();
+    const raw = z || d;
+    const n = normalizarTextoZonaCola(raw);
+    if (!n) return '';
+    const first = (n.split(/[\s,;]+/)[0] || n).replace(/[^a-z0-9ñ]/gi, '');
+    return first || n.slice(0, 24);
+}
+
+function longitudPrefijoComunCola(a, b) {
+    const s = String(a || '');
+    const t = String(b || '');
+    let i = 0;
+    const lim = Math.min(s.length, t.length);
+    while (i < lim && s[i] === t[i]) i += 1;
+    return i;
+}
+
+/** Dos tokens del mismo “corredor” (Mendiola / Mendiolaza, La Calera / calera…). */
+function tokensMismoCorredorCola(a, b, minPrefijo) {
+    const minP = Math.max(3, Math.min(14, Number(minPrefijo) || 6));
+    const s = String(a || '');
+    const t = String(b || '');
+    if (!s || !t) return false;
+    if (s === t) return true;
+    const headS = s.slice(0, minP);
+    const headT = t.slice(0, minP);
+    if (headS.length >= minP && t.startsWith(headS)) return true;
+    if (headT.length >= minP && s.startsWith(headT)) return true;
+    return longitudPrefijoComunCola(s, t) >= minP;
+}
+
+/**
+ * True si hay ≥2 pedidos y las zonas/direcciones parecen el mismo corredor (p. ej. Mendiola + Mendiolaza).
+ */
+function colaZonasMismoCorredorPedidos(pedidos, minPrefijo) {
+    if (!pedidos || pedidos.length < 2) return false;
+    const tokens = pedidos.map(tokenZonaClusterCola);
+    if (tokens.some((t) => !t)) return false;
+    for (let i = 0; i < tokens.length; i += 1) {
+        for (let j = i + 1; j < tokens.length; j += 1) {
+            if (!tokensMismoCorredorCola(tokens[i], tokens[j], minPrefijo)) return false;
+        }
+    }
+    return true;
+}
+
+function debeDispararRutaColaLena(totalKg, pedidosEnCola, cfg) {
+    if (totalKg <= 0 || !pedidosEnCola?.length) return { disparar: false, motivo: '' };
+    if (totalKg >= cfg.umbralDisparoRutaKg) return { disparar: true, motivo: 'umbral_camion' };
+    const ucz = cfg.umbralClusterZonaKg;
+    if (
+        ucz != null
+        && Number.isFinite(ucz)
+        && ucz >= 100
+        && ucz < cfg.umbralDisparoRutaKg
+        && totalKg >= ucz
+        && colaZonasMismoCorredorPedidos(pedidosEnCola, cfg.clusterZonaMinPrefijo)
+    ) {
+        return { disparar: true, motivo: 'umbral_zona_cercana' };
+    }
+    return { disparar: false, motivo: '' };
+}
+
+/**
+ * Umbrales y textos de cola (merge con `config/general` vía Firestore).
+ * `colaLenaUmbralClusterZonaKg`: 0 o ausente inválido → null (solo umbral principal).
+ */
+async function obtenerConfigColaLena() {
+    const plantillaDef =
+        'Hola {nombre}! Armamos una salida de leña por tu zona ({zona}) y podemos llevarte el pedido *sin cargo de flete* aprovechando el mismo viaje. Te avisamos cuando coordinemos el día. — Vicky, Gardens Wood';
+    const out = {
+        capacidadCamionKg: COLA_LENA_DEFAULTS.capacidadCamionKg,
+        umbralDisparoRutaKg: COLA_LENA_DEFAULTS.umbralDisparoRutaKg,
+        umbralClusterZonaKg: /** @type {number | null} */ (800),
+        clusterZonaMinPrefijo: 6,
+        notificarClientesRuta: true,
+        plantillaClienteRuta: plantillaDef,
+        telefonoAvisoRutaCopia: '',
+    };
+    if (!firestoreModule.isAvailable()) {
+        if (out.umbralDisparoRutaKg > out.capacidadCamionKg) out.umbralDisparoRutaKg = out.capacidadCamionKg;
+        return out;
+    }
+    try {
+        const cg = await firestoreModule.getConfigGeneral({});
+        const c = Number(cg.colaLenaCapacidadCamionKg);
+        const u = Number(cg.colaLenaUmbralDisparoRutaKg);
+        if (Number.isFinite(c) && c >= 200 && c <= 20000) out.capacidadCamionKg = Math.round(c);
+        if (Number.isFinite(u) && u >= 200 && u <= 20000) out.umbralDisparoRutaKg = Math.round(u);
+        const rawCl = cg.colaLenaUmbralClusterZonaKg;
+        if (rawCl === 0 || rawCl === '0') {
+            out.umbralClusterZonaKg = null;
+        } else {
+            const uc = Number(rawCl);
+            if (Number.isFinite(uc) && uc >= 100 && uc <= 20000) out.umbralClusterZonaKg = Math.round(uc);
+            else if (rawCl === undefined || rawCl === null || rawCl === '') {
+                out.umbralClusterZonaKg = 800;
+            } else {
+                out.umbralClusterZonaKg = null;
+            }
+        }
+        const mp = Number(cg.colaLenaClusterZonaMinPrefijo);
+        if (Number.isFinite(mp) && mp >= 3 && mp <= 14) out.clusterZonaMinPrefijo = Math.round(mp);
+        if (cg.colaLenaNotificarClientesRutaArmada === false) out.notificarClientesRuta = false;
+        const tpl = String(cg.colaLenaPlantillaWAClienteRutaArmada || '').trim();
+        if (tpl) out.plantillaClienteRuta = tpl;
+        const copia = String(cg.colaLenaTelefonoAvisoRutaCopia || '').replace(/\D/g, '');
+        if (copia.length >= 10) out.telefonoAvisoRutaCopia = copia;
+    } catch (_) { /* defaults */ }
+    if (out.umbralDisparoRutaKg > out.capacidadCamionKg) out.umbralDisparoRutaKg = out.capacidadCamionKg;
+    if (out.umbralClusterZonaKg != null && out.umbralClusterZonaKg >= out.umbralDisparoRutaKg) {
+        out.umbralClusterZonaKg = null;
+    }
+    return out;
+}
+
+function armarTextoAvisoAdminRutaLeña(pedidosOrdenados, metrosRutaTotales, motivoDisparo) {
+    const total = pedidosOrdenados.reduce((sum, p) => sum + (p.cantidadKg || 0), 0);
+    const ruta = pedidosOrdenados.map((p, idx) => {
+        const zonaTexto = p.zona ? ` (${p.zona})` : '';
+        const tel = getTel(p.remoteJid);
+        const tipoTxt = p.tipoLena ? ` — ${p.tipoLena}` : '';
+        const ordenTxt = p.ordenRuta != null ? `${p.ordenRuta}. ` : `${idx + 1}. `;
+        const kgTxt = (p.cantidadKg != null && Number(p.cantidadKg) > 0) ? `${p.cantidadKg}kg` : 'kg pend.';
+        return `• ${ordenTxt}${p.nombre || 'Sin nombre'} — ${kgTxt}${tipoTxt} — ${p.direccion}${zonaTexto} ☎ ${tel}`;
+    }).join('\n');
+
+    const ciudades = [...new Set(pedidosOrdenados.map(p => p.zona || '').filter(Boolean))];
+    const rutaTexto = ciudades.length > 0 ? `\n_Zonas en el lote:_ ${ciudades.join(' · ')}` : '';
+    const grupoTxt = pedidosOrdenados[0]?.rutaGrupoId ? `\n*Grupo ruta:* \`${pedidosOrdenados[0].rutaGrupoId}\`` : '';
+    const kmTxt =
+        metrosRutaTotales != null && Number.isFinite(metrosRutaTotales) && metrosRutaTotales > 0
+            ? `\n*Km ruta estimados (ida + paradas + vuelta):* ~${(metrosRutaTotales / 1000).toFixed(1)} km`
+            : '';
+    const motivoTxt = motivoDisparo === 'umbral_zona_cercana'
+        ? '\n_Motivo: mismo corredor de zona + kg alcanzan el umbral de “zona cercana” (config `colaLenaUmbralClusterZonaKg`)._\n'
+        : '';
+
+    return (
+        `🪵 *RUTA DE LEÑA LISTA*\n`
+        + motivoTxt
+        + `Total del lote: *${total}* kg · *${pedidosOrdenados.length}* parada(s)${grupoTxt}${kmTxt}\n\n`
+        + `*Orden sugerido (minimizar recorrido desde ${BASE_LOCATION}):*\n`
+        + `${ruta}${rutaTexto}\n\n`
+        + '_En el panel figuran como *notificado*; coordiná entrega con cada cliente._'
+    );
+}
+
+async function notificarAdminRutaLeñaConCopia(pedidosOrdenados, metrosRutaTotales, motivoDisparo, cfgCola) {
+    const sock = vickySocketRef.current;
+    if (!sock) {
+        console.warn('⚠️ notificarAdminRutaLeñaConCopia: sin socket activo');
+        return;
+    }
+    const mensaje = armarTextoAvisoAdminRutaLeña(pedidosOrdenados, metrosRutaTotales, motivoDisparo);
+    const adminDigits = vickyRuntimeCfg.ADMIN_PHONE_DIGITS || String(ADMIN_PHONE || '').replace(/\D/g, '');
+    if (adminDigits.length >= 10) {
+        try {
+            const sent = await sock.sendMessage(`${adminDigits}@s.whatsapp.net`, { text: mensaje });
+            if (sent?.key?.id) BOT_MSG_IDS.add(sent.key.id);
+            console.log(`📬 Aviso de ruta → admin (${adminDigits.slice(0, 4)}…)`);
+        } catch (e) {
+            console.error('❌ Error notificando admin ruta:', e.message);
+        }
+    } else {
+        console.warn('⚠️ Admin sin teléfono (adminPhone / ADMIN_PHONE): no se envía aviso de ruta.');
+    }
+    const copia = String(cfgCola?.telefonoAvisoRutaCopia || '').replace(/\D/g, '');
+    if (copia.length >= 10 && copia !== adminDigits) {
+        try {
+            const sent2 = await sock.sendMessage(`${copia}@s.whatsapp.net`, { text: mensaje });
+            if (sent2?.key?.id) BOT_MSG_IDS.add(sent2.key.id);
+            console.log(`📬 Copia aviso ruta → ${copia.slice(0, 4)}…`);
+        } catch (e) {
+            console.error('❌ Error notificando copia ruta:', e.message);
+        }
+    }
+}
+
+async function notificarClientesRutaColaArmada(pedidosOrdenados, cfgCola) {
+    if (!cfgCola?.notificarClientesRuta) return;
+    const tpl = String(cfgCola.plantillaClienteRuta || '').trim();
+    if (!tpl) return;
+    for (const p of pedidosOrdenados) {
+        const jid = p.remoteJid;
+        if (!jid || String(jid).startsWith('ig:')) continue;
+        const nombre = (p.nombre && String(p.nombre).trim()) || '';
+        const nombreSaludo = nombre && !textoPareceSoloTelefono(nombre) ? nombre.split(/\s+/)[0] : 'Hola';
+        const zona = (p.zona && String(p.zona).trim()) || 'tu zona';
+        const kgTxt = (p.cantidadKg != null && Number(p.cantidadKg) > 0) ? `${p.cantidadKg} kg` : 'tu pedido de leña';
+        const msg = tpl
+            .replace(/\{nombre\}/gi, nombreSaludo)
+            .replace(/\{zona\}/gi, zona)
+            .replace(/\{kg\}/gi, kgTxt);
+        try {
+            await sendBotMessage(jid, { text: msg });
+            const histCl = getCliente(jid);
+            firestoreModule
+                .logMensaje({
+                    jid,
+                    tipo: 'texto',
+                    contenido: msg,
+                    direccion: 'saliente',
+                    servicio: histCl?.servicioPendiente || 'lena',
+                    clienteInfo: {
+                        nombre: histCl?.nombre,
+                        estado: histCl?.estado,
+                        servicioPendiente: histCl?.servicioPendiente,
+                    },
+                })
+                .catch(() => {});
+        } catch (e) {
+            console.warn(`⚠️ WA cliente ruta cola ${jid}:`, e.message);
+        }
+    }
+}
+
+async function enriquecerPedidosColaConCoordenadasCRM(pedidos) {
+    if (!firestoreModule.isAvailable() || typeof firestoreModule.getClienteLatLngPorDocId !== 'function') {
+        return pedidos.map((p) => ({ ...p }));
+    }
+    const salida = [];
+    for (const p of pedidos) {
+        const tel = getTel(p.remoteJid);
+        let row = { ...p };
+        if (tel) {
+            const ll = await firestoreModule.getClienteLatLngPorDocId(tel);
+            if (ll && ll.lat != null && ll.lng != null) {
+                row = { ...row, lat: ll.lat, lng: ll.lng };
+            }
+        }
+        salida.push(row);
+    }
+    return salida;
+}
+
+function haversineMetros(a, b) {
+    const R = 6371000;
+    const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+    const dLng = ((b.lng - a.lng) * Math.PI) / 180;
+    const la1 = (a.lat * Math.PI) / 180;
+    const la2 = (b.lat * Math.PI) / 180;
+    const s = Math.sin(dLat / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
+}
+
+/** Vecino más cercano desde depósito y entre paradas (minimiza km sin Directions). Sin coords: al final por fecha de pedido. */
+function ordenarRutaColaVecinoMasCercano(pedidos) {
+    const con = pedidos.filter((p) => p.lat != null && p.lng != null && Number.isFinite(p.lat) && Number.isFinite(p.lng));
+    const sin = pedidos.filter((p) => p.lat == null || p.lng == null || !Number.isFinite(p.lat) || !Number.isFinite(p.lng));
+    sin.sort((a, b) => new Date(a.fechaPedido || 0) - new Date(b.fechaPedido || 0));
+    if (con.length === 0) return sin;
+    const pending = [...con];
+    const route = [];
+    let cur = { ...BASE_LOCATION_LATLNG };
+    while (pending.length) {
+        let bestI = 0;
+        let bestD = Infinity;
+        for (let i = 0; i < pending.length; i++) {
+            const p = pending[i];
+            const d = haversineMetros(cur, { lat: p.lat, lng: p.lng });
+            if (d < bestD) {
+                bestD = d;
+                bestI = i;
+            }
+        }
+        const [next] = pending.splice(bestI, 1);
+        route.push(next);
+        cur = { lat: next.lat, lng: next.lng };
+    }
+    return route.concat(sin);
+}
+
+/** Distance Matrix 1×N desde base (orden tipo “estrella”). */
+async function ordenarPedidosColaPorDistanciaDesdeBase(pedidos) {
     if (!GOOGLE_MAPS_API_KEY || pedidos.length === 0) {
-        // Sin API key: ordenar por zona alfabéticamente como fallback
         return [...pedidos].sort((a, b) => (a.zona || a.direccion || '').localeCompare(b.zona || b.direccion || ''));
     }
     try {
-        const destinos = pedidos.map(p => encodeURIComponent(p.direccion + ', Córdoba, Argentina')).join('|');
+        const destinos = pedidos
+            .map((p) => encodeURIComponent(String(p.direccion || '').trim() + ', Córdoba, Argentina'))
+            .join('|');
         const origen = encodeURIComponent(BASE_LOCATION);
         const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${origen}&destinations=${destinos}&key=${GOOGLE_MAPS_API_KEY}&language=es`;
 
@@ -2041,7 +2336,7 @@ async function calcularRutaOptima(pedidos) {
         const filas = data.rows[0]?.elements || [];
         const conDistancia = pedidos.map((p, i) => ({
             ...p,
-            distanciaMetros: filas[i]?.status === 'OK' ? (filas[i].distance?.value || 999999) : 999999
+            distanciaMetros: filas[i]?.status === 'OK' ? (filas[i].distance?.value || 999999) : 999999,
         }));
 
         return conDistancia.sort((a, b) => a.distanciaMetros - b.distanciaMetros);
@@ -2051,41 +2346,96 @@ async function calcularRutaOptima(pedidos) {
     }
 }
 
-async function notificarAdmin(pedidosOrdenados) {
-    const sock = vickySocketRef.current;
-    if (!sock) {
-        console.warn('⚠️ notificarAdmin: sin socket activo');
-        return;
-    }
-    const adminDigits = vickyRuntimeCfg.ADMIN_PHONE_DIGITS || String(ADMIN_PHONE || '').replace(/\D/g, '');
-    if (adminDigits.length < 10) {
-        console.warn('⚠️ Admin sin teléfono (panel adminPhone o ADMIN_PHONE): no se puede notificar ruta leña.');
-        return;
-    }
-    const adminJid = `${adminDigits}@s.whatsapp.net`;
-    const total = pedidosOrdenados.reduce((sum, p) => sum + (p.cantidadKg || 0), 0);
-    const ruta = pedidosOrdenados.map((p, idx) => {
-        const zonaTexto = p.zona ? ` (${p.zona})` : '';
-        const tel = getTel(p.remoteJid);
-        const tipoTxt = p.tipoLena ? ` — ${p.tipoLena}` : '';
-        const ordenTxt = p.ordenRuta != null ? `${p.ordenRuta}. ` : `${idx + 1}. `;
-        const kgTxt = (p.cantidadKg != null && Number(p.cantidadKg) > 0) ? `${p.cantidadKg}kg` : 'kg pend.';
-        return `• ${ordenTxt}${p.nombre || 'Sin nombre'} — ${kgTxt}${tipoTxt} — ${p.direccion}${zonaTexto} ☎ ${tel}`;
-    }).join('\n');
+const COLA_LENA_MAX_WAYPOINTS_DIRECTIONS = 23;
 
-    const ciudades = [...new Set(pedidosOrdenados.map(p => p.zona || '').filter(Boolean))];
-    const rutaTexto = ciudades.length > 0 ? `\nRuta sugerida: Villa Allende → ${ciudades.join(' → ')}` : '';
-    const grupoTxt = pedidosOrdenados[0]?.rutaGrupoId ? `\n*Grupo ruta:* \`${pedidosOrdenados[0].rutaGrupoId}\`` : '';
-
-    const mensaje = `🪵 *RUTA DE LEÑA LISTA*\nTotal acumulado: ${total}kg (${pedidosOrdenados.length} clientes)${grupoTxt}\n\n*Clientes en ruta (ordenados por proximidad):*\n${ruta}${rutaTexto}\n\nLos pedidos fueron removidos de la cola. Coordiná las entregas directamente con cada cliente.`;
-
-    try {
-        const sent = await sock.sendMessage(adminJid, { text: mensaje });
-        if (sent?.key?.id) BOT_MSG_IDS.add(sent.key.id);
-        console.log(`📬 Notificación de ruta enviada al admin (${adminDigits.slice(0, 4)}…)`);
-    } catch (e) {
-        console.error('❌ Error notificando admin:', e.message);
+function textoWaypointColaLeña(p) {
+    if (p.lat != null && p.lng != null && Number.isFinite(p.lat) && Number.isFinite(p.lng)) {
+        return `${p.lat},${p.lng}`;
     }
+    const d = String(p.direccion || '').trim() || String(p.zona || '').trim() || 'Villa Allende';
+    return `${d}, Córdoba, Argentina`;
+}
+
+/**
+ * Orden de visitas: Directions `optimize:true` (ida y vuelta al depósito) o vecino más cercano / matriz.
+ * @param {{ metrosTotales?: number | null }} [meta]
+ */
+async function optimizarRutaEntregasColaLeña(pedidos, meta) {
+    const n = pedidos.length;
+    if (n <= 1) {
+        if (meta) meta.metrosTotales = null;
+        return pedidos;
+    }
+
+    const todosCoords = pedidos.every(
+        (p) => p.lat != null && p.lng != null && Number.isFinite(p.lat) && Number.isFinite(p.lng)
+    );
+
+    if (n > COLA_LENA_MAX_WAYPOINTS_DIRECTIONS) {
+        console.warn(`🪵 Cola: ${n} paradas (> ${COLA_LENA_MAX_WAYPOINTS_DIRECTIONS}). Ruta sin Directions optimize.`);
+        const nn = todosCoords ? ordenarRutaColaVecinoMasCercano(pedidos) : await ordenarPedidosColaPorDistanciaDesdeBase(pedidos);
+        if (meta && todosCoords) {
+            let m = 0;
+            let cur = { ...BASE_LOCATION_LATLNG };
+            for (const p of nn) {
+                if (p.lat != null && p.lng != null) {
+                    m += haversineMetros(cur, { lat: p.lat, lng: p.lng });
+                    cur = { lat: p.lat, lng: p.lng };
+                }
+            }
+            m += haversineMetros(cur, BASE_LOCATION_LATLNG);
+            meta.metrosTotales = m;
+        } else if (meta) {
+            meta.metrosTotales = null;
+        }
+        return nn;
+    }
+
+    if (GOOGLE_MAPS_API_KEY) {
+        try {
+            const origin = encodeURIComponent(BASE_LOCATION);
+            const parts = pedidos.map((p) => encodeURIComponent(textoWaypointColaLeña(p))).join('|');
+            const url =
+                `https://maps.googleapis.com/maps/api/directions/json`
+                + `?origin=${origin}&destination=${origin}`
+                + `&waypoints=optimize:true|${parts}`
+                + `&key=${GOOGLE_MAPS_API_KEY}&language=es`;
+            const resp = await fetch(url);
+            const data = await resp.json();
+            if (data.status === 'OK' && data.routes?.[0]) {
+                const r0 = data.routes[0];
+                const order = r0.waypoint_order;
+                if (Array.isArray(order) && order.length === n) {
+                    let metros = 0;
+                    for (const leg of r0.legs || []) {
+                        if (leg?.distance?.value != null) metros += leg.distance.value;
+                    }
+                    if (meta) meta.metrosTotales = metros > 0 ? metros : null;
+                    return order.map((i) => pedidos[i]);
+                }
+            }
+            console.warn('⚠️ Directions optimize:', data?.status || 'sin ruta', data?.error_message || '');
+        } catch (e) {
+            console.warn('⚠️ Directions optimize:', e.message);
+        }
+    }
+
+    const nn = todosCoords ? ordenarRutaColaVecinoMasCercano(pedidos) : await ordenarPedidosColaPorDistanciaDesdeBase(pedidos);
+    if (meta && todosCoords) {
+        let m = 0;
+        let cur = { ...BASE_LOCATION_LATLNG };
+        for (const p of nn) {
+            if (p.lat != null && p.lng != null) {
+                m += haversineMetros(cur, { lat: p.lat, lng: p.lng });
+                cur = { lat: p.lat, lng: p.lng };
+            }
+        }
+        m += haversineMetros(cur, BASE_LOCATION_LATLNG);
+        meta.metrosTotales = m;
+    } else if (meta) {
+        meta.metrosTotales = null;
+    }
+    return nn;
 }
 
 async function agregarAColaLena(remoteJid, nombre, direccion, zona, cantidadKg, tipoLena = null) {
@@ -2118,13 +2468,20 @@ async function agregarAColaLena(remoteJid, nombre, direccion, zona, cantidadKg, 
     }
     await saveColaLenaGCS();
 
+    const cfgCola = await obtenerConfigColaLena();
     const totalActual = totalKgEnCola();
-    console.log(`🪵 Total en cola: ${totalActual}kg / ${UMBRAL_COLA_KG}kg`);
+    const pedidosPendientes = colaLena.filter(p => p.estado === 'en_cola');
+    const { disparar, motivo } = debeDispararRutaColaLena(totalActual, pedidosPendientes, cfgCola);
+    const extraZona = cfgCola.umbralClusterZonaKg != null
+        ? ` · zona cercana ≥${cfgCola.umbralClusterZonaKg}kg si el corredor coincide`
+        : '';
+    console.log(`🪵 Total en cola: ${totalActual}kg (camión ref. ${cfgCola.capacidadCamionKg}kg · disparo ${cfgCola.umbralDisparoRutaKg}kg${extraZona})`);
 
-    if (totalActual >= UMBRAL_COLA_KG) {
-        console.log(`🚚 Cupo alcanzado (${totalActual}kg). Calculando ruta óptima...`);
-        const pedidosPendientes = colaLena.filter(p => p.estado === 'en_cola');
-        const pedidosOrdenados = await calcularRutaOptima(pedidosPendientes);
+    if (disparar) {
+        console.log(`🚚 Ruta (${motivo}): ${totalActual}kg. Optimizando orden de visitas…`);
+        const enriquecidos = await enriquecerPedidosColaConCoordenadasCRM(pedidosPendientes);
+        const metaRuta = { metrosTotales: /** @type {number | null} */ (null) };
+        const pedidosOrdenados = await optimizarRutaEntregasColaLeña(enriquecidos, metaRuta);
         const rutaGrupoId = `rg_${Date.now()}`;
         pedidosOrdenados.forEach((pSort, i) => {
             const t = getTel(pSort.remoteJid);
@@ -2132,6 +2489,8 @@ async function agregarAColaLena(remoteJid, nombre, direccion, zona, cantidadKg, 
             if (orig) {
                 orig.ordenRuta = i + 1;
                 orig.rutaGrupoId = rutaGrupoId;
+                if (pSort.lat != null && Number.isFinite(pSort.lat)) orig.lat = pSort.lat;
+                if (pSort.lng != null && Number.isFinite(pSort.lng)) orig.lng = pSort.lng;
             }
         });
 
@@ -2149,7 +2508,8 @@ async function agregarAColaLena(remoteJid, nombre, direccion, zona, cantidadKg, 
         pedidosPendientes.forEach(p => { p.estado = 'notificado'; });
         await saveColaLenaGCS();
 
-        await notificarAdmin(paraMensajeAdmin);
+        await notificarAdminRutaLeñaConCopia(paraMensajeAdmin, metaRuta.metrosTotales, motivo, cfgCola);
+        await notificarClientesRutaColaArmada(paraMensajeAdmin, cfgCola);
     }
 }
 
@@ -2259,6 +2619,9 @@ Tu trabajo es interpretar la instrucción y responder SIEMPRE con uno de estos m
 7. [ENVIAR_A:CAMPANA_LENA|mensaje] o [ENVIAR_A:CAMPANA_LEÑA|mensaje], [ENVIAR_A:CAMPANA_CERCO|…], [ENVIAR_A:CAMPANA_PERGOLA|…], [ENVIAR_A:CAMPANA_FOGONERO|…]
    Igual pero solo quienes tienen servicioPendiente alineado a ese rubro.
 
+8. [REPORTE_MENSAJES_HOY]
+   Cuando el admin pide el resumen del día: mensajes recibidos hoy, actividad de hoy, qué entró hoy por WhatsApp, volumen por servicio, etc. (usa el log Firestore del día en hora Córdoba).
+
 ── EJEMPLOS ──
 - "Vicky lista" → [LISTAR_CLIENTES]
 - "Mostrá los clientes" → [LISTAR_CLIENTES]
@@ -2271,6 +2634,7 @@ Tu trabajo es interpretar la instrucción y responder SIEMPRE con uno de estos m
 - "Mandá al 3512956376 que pasamos a medir el jueves a las 10" → [ENVIAR_A:3512956376|Hola! Confirmamos que pasamos a medir el jueves a las 10. Cualquier cambio avisame.]
 - "A todos los clientes avisales que esta semana hay promo de leña" → [ENVIAR_A:CAMPANA_TODOS|Buenas tardes! Te queremos avisar que esta semana tenemos novedades en leña. Cualquier consulta escribinos.]
 - "Mandá a los de leña que subió el precio del carbón" → [ENVIAR_A:CAMPANA_LENA|Hola! Te avisamos una actualización sobre carbón y leña. Si querés te pasamos detalle.]
+- "Qué mensajes entraron hoy" / "resumen del día por servicio" / "cuánto hablaron hoy los clientes" → [REPORTE_MENSAJES_HOY]
 
 ── REGLAS ──
 - Si el destinatario es un número, extraelo limpio (solo dígitos).
@@ -2763,6 +3127,7 @@ async function ejecutarColaLenaAdminManualSiCorresponde({
                 text:
                     '🪵 *#cola_lena* — alta en *cola de leña* (ruta grupal / panel).\n\n'
                     + '*Solo teléfono:* el bot usa *nombre, dirección, zona y tipo leña* del CRM si existen; los *kg* los intenta sacar del historial (cotización/pedidos leña). Si no hay kg → *0 kg* (pendiente; no suma al umbral hasta que pongas kg).\n'
+                    + '_Con *lat/lng* en la ficha Cliente (geocodificador del panel) la ruta se ordena mejor para menos kilómetros._\n'
                     + '`#cola_lena 549…` · `#cola_lena +54 9 351 …`\n\n'
                     + '*Opcional explícito:* `… kg` [hogar|salamandra|parrilla] [| dirección]\n'
                     + 'Ej: `#cola_lena 5493517361472 100 salamandra | Calle X 123`\n\n'
@@ -2848,18 +3213,24 @@ async function ejecutarColaLenaAdminManualSiCorresponde({
               ? `${jidStr.slice(0, 26)}…`
               : jidStr;
     const tot = totalKgEnCola();
+    const cfgColaAdm = await obtenerConfigColaLena();
+    const { capacidadCamionKg, umbralDisparoRutaKg, umbralClusterZonaKg } = cfgColaAdm;
     const kgResumen =
         cantidadKg > 0
             ? `*${cantidadKg} kg*`
             : '*0 kg (pendiente)* — no suma al umbral hasta que cargues kg (`#cola_lena … …kg` o historial CRM)';
     const tipoTxt = tipoLena ? `🪵 Tipo: *${tipoLena}*\n` : '';
+    const zonaHint =
+        umbralClusterZonaKg != null
+            ? ` · *Zona cercana:* si varios pedidos comparten zona parecida, ruta desde *${umbralClusterZonaKg}* kg (\`colaLenaUmbralClusterZonaKg\`; poné *0* para apagar)`
+            : '';
     await sendBotMessage(remoteJid, {
         text:
             `✅ *Cola leña* — ${kgResumen} → *${nombre || refChat}*\n`
             + `📱 \`${refChat}\`\n`
             + tipoTxt
             + `📍 ${direccion.slice(0, 120)}${direccion.length > 120 ? '…' : ''}\n`
-            + `_Total en cola (en_cola): ~*${tot}* kg / umbral ruta *${UMBRAL_COLA_KG}* kg._`,
+            + `_Total en cola (en_cola): *${tot}* / *${capacidadCamionKg}* kg (barra). Umbral camión *${umbralDisparoRutaKg}* kg${zonaHint}. Al disparar: aviso a clientes (flete sin cargo) + admin + copia si configuraste \`colaLenaTelefonoAvisoRutaCopia\`._`,
     });
     persistAdminWaSessionFirestore(remoteJid).catch(() => {});
     return true;
@@ -3131,6 +3502,16 @@ async function procesarComandoAdmin(adminJid, audioBase64, textoAdmin) {
             sesion.listaClientes = mapa;
             adminSesionesActivas.set(adminJid, sesion);
             await responder(adminJid, { text: texto });
+            return;
+        }
+
+        if (/\[REPORTE_MENSAJES_HOY\]/i.test(respuesta)) {
+            if (!firestoreModule.isAvailable()) {
+                await responder(adminJid, { text: '❌ Firestore no disponible.' });
+                return;
+            }
+            const txt = await firestoreModule.getReporteMensajesHoySoloTexto();
+            await responder(adminJid, { text: txt });
             return;
         }
 

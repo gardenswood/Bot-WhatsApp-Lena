@@ -233,6 +233,13 @@ async function syncColaLena(colaLena) {
                     if (pedido.rutaGrupoId) data.rutaGrupoId = String(pedido.rutaGrupoId);
                 }
 
+                const la = readScalarCoordCampana(pedido.lat);
+                const ln = readScalarCoordCampana(pedido.lng);
+                if (la != null && ln != null) {
+                    data.lat = la;
+                    data.lng = ln;
+                }
+
                 batch.set(ref, data, { merge: true });
             }
             await batch.commit();
@@ -283,6 +290,24 @@ async function getConfigGeneral(opts) {
         whatsappGrupoJidAgendaEntregas: '',
         /** Si es false, no se envía mensaje al grupo aunque haya JID (panel General). */
         notificarAgendaEntregasGrupoActivo: true,
+        /** Capacidad de referencia del camión de leña (kg) — barra del panel y textos admin. */
+        colaLenaCapacidadCamionKg: 1000,
+        /** Suma de kg en cola (`en_cola`) para armar ruta optimizada y avisar al admin (≤ capacidad). */
+        colaLenaUmbralDisparoRutaKg: 1000,
+        /**
+         * Si la suma de kg ≥ este valor **y** todas las zonas/direcciones parecen el mismo corredor (prefijo común),
+         * se dispara la ruta sin esperar al umbral principal (ej. Mendiola + Mendiolaza con 800 kg). `null` = desactivado.
+         */
+        colaLenaUmbralClusterZonaKg: 800,
+        /** Mínimo de caracteres de prefijo común entre el primer token de zona/dirección (default 6). */
+        colaLenaClusterZonaMinPrefijo: 6,
+        /** Tras armar la ruta, enviar WA a cada cliente con esta plantilla (`{nombre}`, `{zona}`, `{kg}`). Vacío = no enviar. */
+        colaLenaPlantillaWAClienteRutaArmada:
+            'Hola {nombre}! Armamos una salida de leña por tu zona ({zona}) y podemos llevarte el pedido *sin cargo de flete* aprovechando el mismo viaje. Te avisamos cuando coordinemos el día. — Vicky, Gardens Wood',
+        /** Si es false, no se envía la plantilla a clientes al armar la ruta. */
+        colaLenaNotificarClientesRutaArmada: true,
+        /** Dígitos de un segundo WhatsApp (ej. Juan / logística) que recibe copia del mismo aviso de ruta que el admin. Vacío = no. */
+        colaLenaTelefonoAvisoRutaCopia: '',
     };
 
     if (!firestoreDb) return DEFAULT_CONFIG;
@@ -980,6 +1005,124 @@ function normalizarTextoReporte(s) {
         .replace(/\p{M}/gu, '');
 }
 
+/** Inicio/fin UTC del día civil en `America/Argentina/Cordoba` (ART = UTC−3, sin DST). */
+function boundsUtcMsDiaCordoba(d = new Date()) {
+    const tz = 'America/Argentina/Cordoba';
+    const ymd = d.toLocaleDateString('en-CA', { timeZone: tz });
+    const [y, mo, da] = ymd.split('-').map((n) => parseInt(n, 10));
+    const startMs = Date.UTC(y, mo - 1, da, 3, 0, 0, 0);
+    const endMs = startMs + 86400000;
+    return { ymd, startMs, endMs };
+}
+
+const MENSAJES_LOG_HOY_LIM = 5000;
+
+/**
+ * Mensajes `mensajes_log` del día (Córdoba), solo entrantes: totales, por servicio (etiqueta al loguear), por JID.
+ * @returns {Promise<{ ymd: string, total: number, chatsUnicos: number, byServicio: Record<string, number>, byJid: Record<string, number>, capped: boolean } | null>}
+ */
+async function agregadosMensajesEntrantesHoyCordoba() {
+    if (!firestoreDb) return null;
+    const admin = require('firebase-admin');
+    const { ymd, startMs, endMs } = boundsUtcMsDiaCordoba();
+    const startTs = admin.firestore.Timestamp.fromMillis(startMs);
+    const endTs = admin.firestore.Timestamp.fromMillis(endMs);
+    const logSnap = await firestoreDb
+        .collection('mensajes_log')
+        .where('timestamp', '>=', startTs)
+        .where('timestamp', '<', endTs)
+        .limit(MENSAJES_LOG_HOY_LIM)
+        .get()
+        .catch((e) => {
+            console.warn('⚠️ agregadosMensajesEntrantesHoyCordoba:', e.message);
+            return { docs: [] };
+        });
+    const byServicio = {};
+    const byJid = {};
+    const jids = new Set();
+    let total = 0;
+    const docs = logSnap.docs || [];
+    for (const doc of docs) {
+        const x = doc.data() || {};
+        if (x.direccion !== 'entrante') continue;
+        total += 1;
+        const jid = x.jid || '?';
+        jids.add(jid);
+        byJid[jid] = (byJid[jid] || 0) + 1;
+        const raw = x.servicio != null && String(x.servicio).trim() ? String(x.servicio).trim() : '';
+        const sk = raw || '(sin servicio en log)';
+        byServicio[sk] = (byServicio[sk] || 0) + 1;
+    }
+    return {
+        ymd,
+        total,
+        chatsUnicos: jids.size,
+        byServicio,
+        byJid,
+        capped: docs.length >= MENSAJES_LOG_HOY_LIM,
+    };
+}
+
+function textoBloqueMensajesHoyAdminWhatsApp(ag) {
+    if (!ag) return '_(Sin datos de mensajes del día.)_';
+    const svcLines = Object.entries(ag.byServicio || {})
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `· ${k}: *${v}* msg`);
+    const lines = [
+        `📥 *Mensajes entrantes hoy* (${ag.ymd} · Córdoba)`,
+        `Total: *${ag.total}* en *${ag.chatsUnicos}* chat(s).`,
+        '',
+        ...(svcLines.length ? ['*Por servicio* (valor de `servicioPendiente` al momento del mensaje):', ...svcLines] : ['_(Sin mensajes entrantes hoy en el log.)_']),
+    ];
+    if (ag.capped) {
+        lines.push('', `_⚠️ Lectura tope ${MENSAJES_LOG_HOY_LIM} filas; el conteo puede estar incompleto._`);
+    }
+    lines.push('', '_Chats con más actividad: *detalle mensajes hoy*._');
+    return lines.join('\n');
+}
+
+async function textoDetalleMensajesHoyReporte() {
+    if (!firestoreDb) return '📋 *Mensajes hoy*\nFirestore no disponible.';
+    const ag = await agregadosMensajesEntrantesHoyCordoba();
+    if (!ag || ag.total === 0) {
+        return `📋 *Mensajes entrantes hoy* (${ag?.ymd || '—'})\n\n(sin registros entrantes en el día).`;
+    }
+    const clientesSnap = await firestoreDb.collection('clientes').limit(1000).get().catch(() => ({ docs: [] }));
+    const jidToTel = construirMapaJidATelefonoCliente(clientesSnap);
+    const sorted = Object.entries(ag.byJid || {}).sort((a, b) => b[1] - a[1]);
+    const lines = [
+        `📋 *Chats con mensajes entrantes hoy* (${ag.ymd} · ${ag.total} msg · ${sorted.length} chats)`,
+        '_Tel sin +54/9; el servicio es el del log al recibir cada mensaje._',
+        '',
+    ];
+    const top = sorted.slice(0, 35);
+    for (const [jid, n] of top) {
+        const porCliente = jidToTel.get(jid);
+        const porJid = telefonoSoloDesdeJidWhatsapp(jid);
+        const tel = porCliente || porJid;
+        if (tel) {
+            lines.push(`· *${tel}* — *${n}* msgs`);
+        } else {
+            const hint = jid.includes('@lid') ? 'contacto @lid (sin tel en clientes)' : String(jid).slice(0, 48);
+            lines.push(`· _${hint}_ — *${n}* msgs`);
+        }
+    }
+    if (sorted.length > top.length) {
+        lines.push(`\n_…y ${sorted.length - top.length} chats más._`);
+    }
+    if (ag.capped) {
+        lines.push(`\n_⚠️ Posible recorte por tope ${MENSAJES_LOG_HOY_LIM} filas/día._`);
+    }
+    return lines.join('\n');
+}
+
+async function getReporteMensajesHoySoloTexto() {
+    if (!firestoreDb) return '❌ Firestore no disponible.';
+    const ag = await agregadosMensajesEntrantesHoyCordoba();
+    if (!ag) return '❌ No se pudo leer el log de hoy.';
+    return textoBloqueMensajesHoyAdminWhatsApp(ag);
+}
+
 function soloDigitosTelReporte(s) {
     return String(s || '').replace(/\D/g, '');
 }
@@ -1220,6 +1363,7 @@ async function getReporteDatosAgregados() {
             .get()
             .catch(() => ({ docs: [] }));
         const logN = logSnap.docs?.length || 0;
+        const mensajesHoy = await agregadosMensajesEntrantesHoyCordoba();
         const lines = [
             `📊 *Reporte Gardens Wood* (${snap.size} clientes en muestra)`,
             '',
@@ -1236,9 +1380,10 @@ async function getReporteDatosAgregados() {
             '',
             `Mensajes log (~${logN} en ${dias}d).`,
             '',
+            ...(mensajesHoy ? [textoBloqueMensajesHoyAdminWhatsApp(mensajesHoy), ''] : []),
             '_Aviso masivo (mismo límite y delay que #ruta): *#enviar clientes …texto…* o *#enviar leña …* / *cerco* / *pergola* / *fogonero* (también *!!enviar*)._',
             '',
-            '_Listado de quienes tienen pedido guardado: *detalle pedidos* (o *#d pedidos*). Otros: *detalle caliente* / *detalle estado X*, *detalle servicio X*, *detalle log*._',
+            '_Listado de quienes tienen pedido guardado: *detalle pedidos* (o *#d pedidos*). Otros: *detalle caliente* / *detalle estado X*, *detalle servicio X*, *detalle log*, *detalle mensajes hoy*._',
         ];
         const indice = {
             muestra: snap.size,
@@ -1248,6 +1393,7 @@ async function getReporteDatosAgregados() {
             servicios: { ...byServicio },
             logCount: logN,
             conPedidosRegistrados,
+            mensajesHoy: mensajesHoy || null,
         };
         return { texto: lines.join('\n'), indice };
     } catch (e) {
@@ -1271,6 +1417,15 @@ function parseConsultaDetalleReporte(raw, indice) {
 
     if (/^pedidos?\s*$/i.test(q.trim()) || /^con\s+pedidos?\s*$/i.test(q.trim())) {
         return { tipo: 'pedidos' };
+    }
+
+    if (
+        /^mensajes?\s*hoy$/i.test(q.trim())
+        || /^msgs?\s*hoy$/i.test(q.trim())
+        || /^mensajes?\s+del\s+dia$/i.test(q.trim())
+        || /^mensajes?\s+del\s+día$/i.test(q.trim())
+    ) {
+        return { tipo: 'mensajes_hoy' };
     }
 
     let m = q.match(/^potencial\s+(.+)$/);
@@ -1307,7 +1462,7 @@ function parseConsultaDetalleReporte(raw, indice) {
     const estadosEj = indice?.estados ? Object.keys(indice.estados).slice(0, 8).join(', ') : 'nuevo, cotizado…';
     const servEj = indice?.servicios ? Object.keys(indice.servicios).slice(0, 6).join(', ') : 'lena, pergola…';
     return {
-        error: `No ubiqué “${q0}”. Probá: *detalle pedidos*, *detalle caliente*, *detalle estado ${estadosEj.split(',')[0] || 'nuevo'}*, *detalle servicio lena*, *detalle log*.\n_Estados: ${estadosEj} · Servicios: ${servEj}_`,
+        error: `No ubiqué “${q0}”. Probá: *detalle pedidos*, *detalle caliente*, *detalle estado ${estadosEj.split(',')[0] || 'nuevo'}*, *detalle servicio lena*, *detalle log*, *detalle mensajes hoy*.\n_Estados: ${estadosEj} · Servicios: ${servEj}_`,
     };
 }
 
@@ -1435,11 +1590,19 @@ const MAX_DETALLE_FILAS = 55;
 /** Tras *#reporte*: *detalle …* o *#d …* — lista clientes o resumen del log. */
 async function getReporteDetalleTexto(consultaRaw, indice) {
     if (!firestoreDb) return 'Firestore no disponible.';
+    const parsed = parseConsultaDetalleReporte(consultaRaw, indice || {});
+    if (parsed.error) return `❌ ${parsed.error}`;
+    if (parsed.tipo === 'mensajes_hoy') {
+        try {
+            return await textoDetalleMensajesHoyReporte();
+        } catch (e) {
+            console.warn('⚠️ getReporteDetalleTexto mensajes_hoy:', e.message);
+            return `❌ Error: ${e.message}`;
+        }
+    }
     if (!indice || typeof indice !== 'object') {
         return 'ℹ️ Primero pedí *#reporte* para generar el resumen; después podés usar *detalle …*.';
     }
-    const parsed = parseConsultaDetalleReporte(consultaRaw, indice);
-    if (parsed.error) return `❌ ${parsed.error}`;
 
     try {
         if (parsed.tipo === 'log') {
@@ -1602,6 +1765,25 @@ function readScalarCoordCampana(v) {
         return Number.isFinite(n) ? n : null;
     }
     return null;
+}
+
+/**
+ * Coordenadas geográficas de la ficha `clientes/{tel}` (mapa / rutas).
+ * @param {string} docId - id del doc (dígitos de línea, sin espacios).
+ * @returns {Promise<null | { lat: number, lng: number }>}
+ */
+async function getClienteLatLngPorDocId(docId) {
+    if (!firestoreDb) return null;
+    const id = String(docId || '').replace(/\D/g, '');
+    if (id.length < 8) return null;
+    try {
+        const snap = await firestoreDb.collection('clientes').doc(id).get();
+        if (!snap.exists) return null;
+        return clienteLatLngFromDocCampana(snap.data() || {});
+    } catch (e) {
+        console.warn('⚠️ getClienteLatLngPorDocId:', e.message);
+        return null;
+    }
 }
 
 /** @param {Record<string, unknown>} x - doc clientes */
@@ -2543,6 +2725,7 @@ module.exports = {
     getReporteResumenTexto,
     getReporteDatosAgregados,
     getReporteDetalleTexto,
+    getReporteMensajesHoySoloTexto,
     listClientesParaCampana,
     getRutaLogistica,
     listClientesParaCampanaGeo,
@@ -2572,5 +2755,6 @@ module.exports = {
     getUltimosMensajesChatItems,
     listarPedidosFlatParaAdminP,
     formatoTelefonoListaAdmin,
+    getClienteLatLngPorDocId,
     isAvailable: () => !!firestoreDb,
 };
