@@ -52,10 +52,11 @@ jobs:
           URL=$(gcloud run services describe vicky-bot \
             --region=us-central1 \
             --format='value(status.url)')
-          echo "🤖 Bot disponible en: $URL"
-          # Cloud Run privado: el token OIDC de GitHub/WIF exige --audiences = URL del servicio
-          TOKEN=$(gcloud auth print-identity-token --audiences="$URL")
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$URL")
-          echo "Health check → $STATUS"
-          test "$STATUS" = "200"
-          echo "✅ Verificación completada"
+          echo "🤖 Bot URL: $URL"
+          # Con WIF, `print-identity-token --audiences` no aplica al tipo de credencial del runner.
+          # Validamos el estado que expone Cloud Run tras el deploy.
+          READY=$(gcloud run services describe vicky-bot --region=us-central1 \
+            --format='value(status.conditions[?(type=="Ready")].status)')
+          echo "Cloud Run Ready: $READY"
+          test "$READY" = "True"
+          echo "✅ Servicio vicky-bot Ready en us-central1"
