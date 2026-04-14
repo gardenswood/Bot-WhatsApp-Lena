@@ -53,10 +53,9 @@ jobs:
             --region=us-central1 \
             --format='value(status.url)')
           echo "🤖 Bot URL: $URL"
-          # Con WIF, `print-identity-token --audiences` no aplica al tipo de credencial del runner.
-          # Validamos el estado que expone Cloud Run tras el deploy.
-          READY=$(gcloud run services describe vicky-bot --region=us-central1 \
-            --format='value(status.conditions[?(type=="Ready")].status)')
+          # Con WIF no conviene `curl` autenticado desde el runner. Comprobamos Ready vía JSON.
+          READY=$(gcloud run services describe vicky-bot --region=us-central1 --format=json \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(c['status'] for c in d['status']['conditions'] if c['type']=='Ready'))")
           echo "Cloud Run Ready: $READY"
           test "$READY" = "True"
           echo "✅ Servicio vicky-bot Ready en us-central1"
