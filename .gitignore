@@ -9,6 +9,3 @@ qr.png
 *.log
 .env
 .env.local
-ElevenLabs_*.mp3
-assets/
-images/

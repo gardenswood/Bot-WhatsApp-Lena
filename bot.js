@@ -461,12 +461,10 @@ const MAX_ENTRADAS_CONSULTAS = 100; // pares cliente/vicky recientes por archivo
 
 // --- AUDIO DE BIENVENIDA (se envía solo la primera vez por cliente) ---
 const AUDIO_INTRO_PATH = path.join(__dirname, 'ElevenLabs_2026-03-21T11_41_40_Melisa_pvc_sp110_s91_sb75_se0_b_m2.mp3');
-const AUDIO_INTRO_EXISTS = fs.existsSync(AUDIO_INTRO_PATH);
-console.log(`🎵 Audio intro: ${AUDIO_INTRO_EXISTS ? '✅ encontrado' : '❌ NO encontrado en ' + AUDIO_INTRO_PATH}`);
+let AUDIO_INTRO_EXISTS = fs.existsSync(AUDIO_INTRO_PATH);
 
 const AUDIO_CONFIRMADO_PATH = path.join(__dirname, 'ElevenLabs_2026-03-21T12_03_41_Melisa_pvc_sp110_s91_sb75_se0_b_m2.mp3');
-const AUDIO_CONFIRMADO_EXISTS = fs.existsSync(AUDIO_CONFIRMADO_PATH);
-console.log(`🎵 Audio confirmado: ${AUDIO_CONFIRMADO_EXISTS ? '✅ encontrado' : '❌ NO encontrado en ' + AUDIO_CONFIRMADO_PATH}`);
+let AUDIO_CONFIRMADO_EXISTS = fs.existsSync(AUDIO_CONFIRMADO_PATH);
 
 // --- IMÁGENES POR SERVICIO ---
 const IMAGENES = {
@@ -476,6 +474,73 @@ const IMAGENES = {
     fogonero: path.join(__dirname, 'images', 'Sector Fogonero', 'WhatsApp Image 2026-03-18 at 16.11.59 (1).jpeg'),
     bancos:   path.join(__dirname, 'images', 'Bancos', 'bancos1.mp4')  // video
 };
+
+function refreshWelcomeAudioFlagsFromDisk() {
+    AUDIO_INTRO_EXISTS = fs.existsSync(AUDIO_INTRO_PATH);
+    AUDIO_CONFIRMADO_EXISTS = fs.existsSync(AUDIO_CONFIRMADO_PATH);
+    console.log(`🎵 Audio intro: ${AUDIO_INTRO_EXISTS ? '✅ encontrado' : '❌ NO encontrado en ' + AUDIO_INTRO_PATH}`);
+    console.log(`🎵 Audio confirmado: ${AUDIO_CONFIRMADO_EXISTS ? '✅ encontrado' : '❌ NO encontrado en ' + AUDIO_CONFIRMADO_PATH}`);
+}
+
+/**
+ * Asegura en disco los binarios que históricamente NO entraban al repo (por `.gitignore`),
+ * descargándolos desde el bucket de Vicky si existen allí.
+ *
+ * Motivación: deploys “limpios” (Cloud Build) pueden quedar sin `ElevenLabs_*.mp3` / imágenes y el audio de bienvenida deja de enviarse.
+ */
+async function ensureBotMediaAssetsFromGcs(opts = {}) {
+    const quiet = !!opts.quiet;
+
+    const introName = path.basename(AUDIO_INTRO_PATH);
+    const confName = path.basename(AUDIO_CONFIRMADO_PATH);
+
+    const introOk = await gcsTryDownloadFirstExisting(
+        AUDIO_INTRO_PATH,
+        [
+            introName,
+            `media/${introName}`,
+            `bot_media/${introName}`,
+            `assets/audio/${introName}`,
+        ],
+        { quiet, label: `intro(${introName})` }
+    );
+
+    const confOk = await gcsTryDownloadFirstExisting(
+        AUDIO_CONFIRMADO_PATH,
+        [
+            confName,
+            `media/${confName}`,
+            `bot_media/${confName}`,
+            `assets/audio/${confName}`,
+        ],
+        { quiet, label: `confirmado(${confName})` }
+    );
+
+    // Catálogo / imágenes usadas por `IMAGENES` (si faltan localmente)
+    for (const rel of Object.values(IMAGENES)) {
+        const abs = path.isAbsolute(rel) ? rel : path.join(__dirname, rel);
+        const base = path.basename(abs);
+        const dirRel = path.dirname(rel);
+        await gcsTryDownloadFirstExisting(
+            abs,
+            [
+                String(rel).replace(/\\/g, '/'),
+                `${String(dirRel).replace(/\\/g, '/')}/${base}`,
+                `media/${base}`,
+                `bot_media/${base}`,
+            ],
+            { quiet, label: base }
+        );
+    }
+
+    refreshWelcomeAudioFlagsFromDisk();
+
+    if (!quiet) {
+        console.log(`🎵 Media sync: intro=${introOk ? 'OK' : 'FALTA'} confirmado=${confOk ? 'OK' : 'FALTA'}`);
+    }
+}
+
+refreshWelcomeAudioFlagsFromDisk();
 
 // --- GEMINI AI ---
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -1439,6 +1504,42 @@ async function downloadFromGCS(opts = {}) {
             console.warn('💡 Local: ejecutá `gcloud auth application-default login` o definí GOOGLE_APPLICATION_CREDENTIALS=ruta\\al\\service-account.json');
         }
     }
+}
+
+/**
+ * Intenta descargar el primer objeto existente entre `candidates` hacia `destPath`.
+ * @param {string} destPath
+ * @param {string[]} candidates — rutas dentro del bucket (sin gs://)
+ * @param {{ quiet?: boolean, label?: string }} opts
+ * @returns {Promise<boolean>}
+ */
+async function gcsTryDownloadFirstExisting(destPath, candidates, opts = {}) {
+    const quiet = !!opts.quiet;
+    const label = opts.label || path.basename(destPath);
+    try {
+        if (fs.existsSync(destPath)) return true;
+        const dir = path.dirname(destPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+        const bucket = storage.bucket(BUCKET_NAME);
+        for (const key of candidates) {
+            const k = String(key || '').replace(/^\/+/, '');
+            if (!k) continue;
+            try {
+                const f = bucket.file(k);
+                const [exists] = await f.exists();
+                if (!exists) continue;
+                await f.download({ destination: destPath });
+                if (!quiet) console.log(`🎞️ Media: descargado ${label} ← gs://${BUCKET_NAME}/${k}`);
+                return true;
+            } catch (e) {
+                console.warn(`⚠️ Media: fallo descargando gs://${BUCKET_NAME}/${key}:`, e.message);
+            }
+        }
+    } catch (e) {
+        console.warn(`⚠️ Media: error resolviendo ${label}:`, e.message);
+    }
+    return fs.existsSync(destPath);
 }
 
 // Debounce para uploads de sesión: evita GCS 429 por subidas masivas de archivos auth
@@ -4252,33 +4353,58 @@ async function ejecutarPipelineBienvenidaYGeminiWhatsappCliente(opts) {
 
     const primerContacto = !session.audioIntroEnviado;
     if (primerContacto) {
-        session.audioIntroEnviado = true;
-        marcarAudioEnviado(remoteJid);
-
-        console.log(`🎵 Enviando audio de bienvenida a ${remoteJid}`);
-        if (AUDIO_INTRO_EXISTS) {
-            try {
-                await sendBotMessage(remoteJid, {
-                    audio: fs.readFileSync(AUDIO_INTRO_PATH),
-                    mimetype: 'audio/mpeg',
-                    ptt: false
-                });
-                await delay(1500);
-            } catch (errAudio) {
-                console.error('❌ Error enviando audio:', errAudio.message);
-            }
-        }
-
-        const esTextoVago = !text || /^(hola|buenas|buen[ao]s?\s*(días?|tardes?|noches?)?|hey|hi|hello|saludos?|buenas?|ey|q tal|como andas?)\s*[!?¡¿.]*$/i.test(String(text).trim());
-        if (esTextoVago && !tieneImagen && !tieneAudio) {
-            await sendBotMessage(remoteJid, { text: vickyRuntimeCfg.mensajeBienvenidaActivo });
+        // Evita carrera: dos `messages.upsert` seguidos pueden entrar ambos con `audioIntroEnviado=false`
+        // antes del primer `await`, y duplican el saludo/audio.
+        if (session.__introLock) {
+            console.log(`⏳ Bienvenida ya en curso (${remoteJid}) — ignorando upsert paralelo`);
             return;
         }
+        session.__introLock = true;
 
-        const omitirTextoBienvenidaExtra = !!(publicidadLead && !esTextoVago);
-        if (!omitirTextoBienvenidaExtra) {
-            await sendBotMessage(remoteJid, { text: vickyRuntimeCfg.mensajeBienvenidaActivo });
-            await delay(1000);
+        try {
+            console.log(`🎵 Bienvenida (primer contacto) → ${remoteJid}`);
+
+            let introAudioOk = false;
+            if (AUDIO_INTRO_EXISTS) {
+                try {
+                    await sendBotMessage(remoteJid, {
+                        audio: fs.readFileSync(AUDIO_INTRO_PATH),
+                        mimetype: 'audio/mpeg',
+                        ptt: false
+                    });
+                    introAudioOk = true;
+                    await delay(1500);
+                } catch (errAudio) {
+                    console.error('❌ Error enviando audio:', errAudio.message);
+                }
+            } else {
+                console.warn(`⚠️ Audio intro ausente en disco (${path.basename(AUDIO_INTRO_PATH)}). Se omite el MP3 de bienvenida.`);
+            }
+
+            const esTextoVago = !text || /^(hola|buenas|buen[ao]s?\s*(días?|tardes?|noches?)?|hey|hi|hello|saludos?|buenas?|ey|q tal|como andas?)\s*[!?¡¿.]*$/i.test(String(text).trim());
+            if (esTextoVago && !tieneImagen && !tieneAudio) {
+                await sendBotMessage(remoteJid, { text: vickyRuntimeCfg.mensajeBienvenidaActivo });
+                session.audioIntroEnviado = true;
+                marcarAudioEnviado(remoteJid);
+                return;
+            }
+
+            const omitirTextoBienvenidaExtra = !!(publicidadLead && !esTextoVago);
+            if (!omitirTextoBienvenidaExtra) {
+                await sendBotMessage(remoteJid, { text: vickyRuntimeCfg.mensajeBienvenidaActivo });
+                await delay(1000);
+            }
+
+            // Importante: solo marcamos “intro enviado” cuando efectivamente completamos el saludo inicial.
+            // Antes se marcaba incluso si faltaba el MP3 en la imagen de Cloud Run, y quedaba bloqueado para siempre.
+            session.audioIntroEnviado = true;
+            marcarAudioEnviado(remoteJid);
+
+            if (!introAudioOk && !omitirTextoBienvenidaExtra) {
+                console.warn(`⚠️ Bienvenida sin MP3 pero con texto extra enviado (${remoteJid}).`);
+            }
+        } finally {
+            session.__introLock = false;
         }
     }
 
@@ -5110,6 +5236,7 @@ async function connectToWhatsApp(isReconnect = false) {
         console.log('🔌 Reconexión WhatsApp…');
     }
     await downloadFromGCS({ quiet: isReconnect });
+    await ensureBotMediaAssetsFromGcs({ quiet: isReconnect });
     loadHistorialLocal();
     await downloadColaLenaGCS({ quiet: isReconnect });
 
