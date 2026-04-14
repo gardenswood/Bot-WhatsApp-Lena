@@ -4391,8 +4391,15 @@ async function ejecutarPipelineBienvenidaYGeminiWhatsappCliente(opts) {
 
             const omitirTextoBienvenidaExtra = !!(publicidadLead && !esTextoVago);
             if (!omitirTextoBienvenidaExtra) {
-                await sendBotMessage(remoteJid, { text: vickyRuntimeCfg.mensajeBienvenidaActivo });
-                await delay(1000);
+                if (esTextoVago) {
+                    // Saludo vago (con imagen/audio): sí mandamos el texto de bienvenida del panel.
+                    await sendBotMessage(remoteJid, { text: vickyRuntimeCfg.mensajeBienvenidaActivo });
+                    await delay(1000);
+                } else {
+                    // Ya viene una consulta concreta: NO mandar el texto corto tipo "escribime porfa"
+                    // antes de Gemini — generaba dos burbujas contradictorias y sensación de "triple" respuesta.
+                    await delay(introAudioOk ? 600 : 400);
+                }
             }
 
             // Importante: solo marcamos “intro enviado” cuando efectivamente completamos el saludo inicial.
@@ -4456,7 +4463,7 @@ async function flushPendingWhatsappGeminiDebounced(remoteJid, snapshot) {
     if (!texts.length) return;
     const merged = texts.length === 1
         ? texts[0]
-        : `[El cliente mandó ${texts.length} mensajes seguidos en la misma ráfaga — respondé en un solo mensaje integrando toda la información, sin repetirte ni contradecirte.]\n`
+        : `[El cliente mandó ${texts.length} mensajes seguidos en la misma ráfaga — respondé en *un solo* mensaje integrando todo, sin repetir listas de precios ni párrafos, sin contradecirte y sin volver a presentar el negocio si ya quedó claro.]\n`
             + texts.map((t, i) => `${i + 1}) ${t}`).join('\n');
     const publicidadLead = snapshot.parts.find(x => x.publicidadLead)?.publicidadLead || null;
 
@@ -4535,7 +4542,13 @@ function scheduleWhatsappGeminiDebounce(remoteJid, part) {
     p.parts.push({ text: part.text, publicidadLead: part.publicidadLead || null });
 
     const maxP = vickyRuntimeCfg.DEBOUNCE_CHAT_MAX_PARTES || 3;
-    const ms = Number(vickyRuntimeCfg.DEBOUNCE_CHAT_MS) || 0;
+    let ms = Number(vickyRuntimeCfg.DEBOUNCE_CHAT_MS) || 0;
+    // Si el panel puso debounce en 0, dos mensajes seguidos del cliente disparan dos Gemini
+    // y duplican info. Hasta el primer saludo (intro) forzamos ~2,8s para fusionar ráfagas.
+    const sessDeb = SESSIONS.get(remoteJid);
+    if (ms <= 0 && sessDeb && !sessDeb.audioIntroEnviado) {
+        ms = 2800;
+    }
 
     if (p.parts.length >= maxP) {
         if (p.timer) clearTimeout(p.timer);
