@@ -575,11 +575,14 @@ async function ejecutarTurnoVickyGeminiCore(deps, params) {
         }
 
         const estadoCliente = getCliente(remoteJid)?.estado;
-        const audioHabilitado = estadoCliente !== 'confirmado' && !esIg;
+        // WhatsApp: los audios TTS (respuesta a voz del cliente, audio junto a imagen, [AUDIO_CORTO:])
+        // deben seguir aunque el CRM marque "confirmado". Solo la fidelización proactiva se omite tras confirmar.
+        const audioTtsHabilitado = !esIg;
+        const audioFidelizacionHabilitado = estadoCliente !== 'confirmado' && !esIg;
 
         const fidelizarMatch = respuesta.match(/\[AUDIO_FIDELIZAR:([^\]]+)\]/i);
         let fraseFidelizarEnviada = null;
-        if (fidelizarMatch && audioHabilitado) {
+        if (fidelizarMatch && audioFidelizacionHabilitado) {
             const fraseFidelizar = fidelizarMatch[1].trim();
             fraseFidelizarEnviada = fraseFidelizar;
             respuesta = respuesta.replace(/\[AUDIO_FIDELIZAR:[^\]]+\]\s*/i, '').trim();
@@ -605,7 +608,7 @@ async function ejecutarTurnoVickyGeminiCore(deps, params) {
         }
 
         let audioEnviado = false;
-        if (tieneAudio && audioHabilitado) {
+        if (tieneAudio && audioTtsHabilitado) {
             const histCliente = getCliente(remoteJid);
             const nombre = histCliente?.nombre;
             if (fraseAudioCorto) {
@@ -622,7 +625,7 @@ async function ejecutarTurnoVickyGeminiCore(deps, params) {
             respuesta = respuesta.replace(/\[IMG:(lena|cerco|pergola|fogonero|bancos)\]/gi, '').trim();
         }
 
-        if (tieneImagen && audioHabilitado && !audioEnviado) {
+        if (tieneImagen && audioTtsHabilitado && !audioEnviado) {
             const textoParaAudio = respuesta
                 .replace(/\[COTIZACION:[^\]]+\]/gi, '')
                 .replace(/\[CONFIRMADO\]/gi, '')
