@@ -5,11 +5,27 @@
 
 const crypto = require('crypto');
 
-const VERIFY = String(process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN || '').trim();
-const APP_SECRET = String(process.env.META_APP_SECRET || process.env.FACEBOOK_APP_SECRET || '').trim();
-const PAGE_TOKEN = String(
-    process.env.INSTAGRAM_PAGE_ACCESS_TOKEN || process.env.FACEBOOK_PAGE_ACCESS_TOKEN || ''
-).trim();
+/** Cloud Run a veces tiene typos en el nombre de la variable (espacio al inicio/fin). */
+function envPrimeroNoVacio(keys) {
+    for (const k of keys) {
+        if (!k) continue;
+        const v = process.env[k];
+        if (v != null && String(v).trim() !== '') return String(v).trim();
+    }
+    return '';
+}
+
+const VERIFY = envPrimeroNoVacio(['INSTAGRAM_WEBHOOK_VERIFY_TOKEN']);
+const APP_SECRET = envPrimeroNoVacio([
+    'META_APP_SECRET',
+    ' META_APP_SECRET',
+    'FACEBOOK_APP_SECRET',
+]);
+const PAGE_TOKEN = envPrimeroNoVacio([
+    'INSTAGRAM_PAGE_ACCESS_TOKEN',
+    'INSTAGRAM_PAGE_ACCESS_TOKEN ',
+    'FACEBOOK_PAGE_ACCESS_TOKEN',
+]);
 const GRAPH_VER = String(process.env.META_GRAPH_VERSION || 'v21.0').replace(/^v?/, 'v');
 
 const processedMids = new Map();

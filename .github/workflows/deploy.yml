@@ -7,6 +7,8 @@ on:
       - 'bot.js'
       - 'vicky-gemini-turn.js'
       - 'firestore-module.js'
+      - 'instagram-dm.js'
+      - 'kontrolpro-admin.js'
       - 'package.json'
       - 'Dockerfile'
       - 'cloudbuild.yaml'
