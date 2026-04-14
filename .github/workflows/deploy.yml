@@ -53,8 +53,9 @@ jobs:
             --region=us-central1 \
             --format='value(status.url)')
           echo "🤖 Bot disponible en: $URL"
-          # Health check (con auth ya que es servicio privado)
-          TOKEN=$(gcloud auth print-identity-token)
+          # Cloud Run privado: el token OIDC de GitHub/WIF exige --audiences = URL del servicio
+          TOKEN=$(gcloud auth print-identity-token --audiences="$URL")
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$URL")
           echo "Health check → $STATUS"
+          test "$STATUS" = "200"
           echo "✅ Verificación completada"
