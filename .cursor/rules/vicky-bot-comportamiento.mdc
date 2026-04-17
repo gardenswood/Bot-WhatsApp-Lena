@@ -34,6 +34,7 @@ alwaysApply: true
 ## Servicios activos
 - Leña, Cercos, Pérgolas, Sector Fogonero, Bancos — IDs Firestore: `lena`, `cerco`, `pergola`, `fogonero`, `bancos` (panel **Precios y servicios**).
 - **Precios y textos de envío:** fuente operativa = Firestore `servicios/*`; el bot anexa el bloque `[DATOS_SERVICIOS_FIRESTORE]` al system prompt al arrancar. Tras editar precios en el panel → **redeploy** `vicky-bot`. El prompt fallback en `bot.js` queda como respaldo si Firestore falla.
+- **Visitas técnicas a domicilio:** Vicky **no** las ofrece ni agenda desde el chat (regla T7 y ancla de identidad en `bot.js`). Presupuestos con medidas/fotos del cliente; showroom / Instagram; si el cliente pide explícitamente que vaya alguien, sin confirmar fecha: `[HANDOFF_EXPERTO:…]`. Si `config/prompts.sistemaPrompt` en Firestore contradice esto, alinearlo en el panel. Ver `RUNBOOK_DEPLOY.md`.
 - Info de envío (`infoEnvio`) en documentos con `tieneEnvio: true` (típicamente leña).
 - **Instagram (@gardens.wood):** mismas reglas y precios que WhatsApp; reutilizá el mismo `sistemaPrompt` y `servicios/*` de Firestore.
 - Esquema y despliegue de reglas/índices: `docs/FIRESTORE_SCHEMA.md`, carpeta `firebase/`.

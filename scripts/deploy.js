@@ -48,7 +48,19 @@ function runDeploy() {
     )
 
     const elapsed = Math.round((Date.now() - start) / 1000)
-    log(`✅ Bot desplegado en ${elapsed}s → https://vicky-bot-uh3qtftq3q-uc.a.run.app`, '\x1b[32m')
+    let serviceUrl = ''
+    try {
+      serviceUrl = execSync(
+        `gcloud run services describe ${SERVICE} --region=${REGION} --format=value(status.url)`,
+        { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+      ).trim()
+    } catch (_) {
+      /* sin gcloud en PATH o sin permisos: solo mostramos tiempo */
+    }
+    log(
+      `✅ Bot desplegado en ${elapsed}s${serviceUrl ? ` → ${serviceUrl}` : ''}`,
+      '\x1b[32m'
+    )
   } catch (err) {
     log('❌ Deploy falló', '\x1b[31m')
     process.exitCode = 1

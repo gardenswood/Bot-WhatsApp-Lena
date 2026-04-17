@@ -53,6 +53,8 @@ Checklist rápida para desplegar cambios sin romper:
 | `colaLena/*` | Cola logística de leña | Espejo GCS ↔ Firestore: pedidos `[PEDIDO_LENA:…]` desde Vicky **o alta manual** WhatsApp admin `#cola_lena` + tel (nombre/dirección/zona/tipo desde CRM si hay; kg inferido del historial o **0** pendiente), o con puente `#c` → `#cola_lena` solo. Sin puente, `#cola_lena` solo = ayuda. `!!cola_lena` si falla el `#`. Cuando la suma de kg `en_cola` ≥ **`config/general.colaLenaUmbralDisparoRutaKg`** (default 1000, alineado a `colaLenaCapacidadCamionKg`), el bot arma **ruta optimizada** (Google **Directions** `optimize:true` si la API key tiene Directions habilitado; si no, vecino más cercano con `lat`/`lng` del CRM o matriz desde Villa Allende) y avisa al admin (`adminPhone` / `ADMIN_PHONE`). | Sí: **redeploy `vicky-bot`** si cambiás lógica de cola o `syncColaLena` |
 | `tiempoSilencioHumanoHoras` | General | **No** cambia el silencio 24 h por mensaje humano desde teléfono (fijo en código); puede usarse como referencia futura | — |
 
+**Visitas técnicas a domicilio:** el instructivo base en código (`bot.js`, regla **T7** del `SYSTEM_PROMPT` y la ancla `SYSTEM_PROMPT_ANCLA_IDENTIDAD`) indica que Vicky **no** debe ofrecer ni agendar idas a medir desde el chat. Si `config/prompts.sistemaPrompt` en Firestore tiene texto antiguo que contradice eso, alinearlo desde el panel **Instrucciones AI**; si no, Gemini puede priorizar el texto del panel.
+
 Documento detallado: [docs/FIRESTORE_SCHEMA.md](docs/FIRESTORE_SCHEMA.md).
 
 ## Equipo stand WhatsApp Lena — Cursor (skill de flujos)
