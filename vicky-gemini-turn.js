@@ -1,5 +1,51 @@
 'use strict';
 
+const kontrolproBridge = require('./kontrolpro-bridge');
+
+/** TTS de acuse si el cliente mandó nota de voz y Gemini no envía [AUDIO_CORTO:…]. Variado; no repetir la misma que el turno anterior (sesión). */
+const FALLBACK_AUDIO_CORTO_SIN_NOMBRE = [
+    'Dale, mirá el mensaje de texto.',
+    'Te lo dejé escrito abajo.',
+    'Listo, fijate en el texto que te mandé.',
+    'Buenísimo, está todo en el mensaje escrito.',
+    'Perfecto, ahí va el detalle por escrito.',
+    'Dale, anotá en el chat lo que te pasé.',
+    'Genial, mirá la respuesta por texto.',
+    'Bárbaro, te lo dejé en el chat escrito.',
+    'Listo, leé el mensaje de texto.',
+    'Dale, en el texto tenés todo despacito.',
+    'Ahí va, está en el mensaje de abajo.',
+    'Mirá el chat, te pasé todo escrito.',
+    'Dale, el detalle está en el mensaje.',
+    'Ok, te lo mandé por escrito abajo.',
+];
+
+const FALLBACK_AUDIO_CORTO_CON_NOMBRE = [
+    'Dale {n}, mirá el texto.',
+    '{n}, te lo dejé escrito abajo.',
+    '{n}, fijate en el mensaje de texto.',
+    'Buenísimo {n}, está todo en el chat escrito.',
+    'Listo {n}, mirá lo que te mandé por escrito.',
+    'Perfecto {n}, en el texto tenés el detalle.',
+    '{n}, ahí va la respuesta por escrito.',
+    'Dale {n}, leé el mensaje de abajo.',
+    'Genial {n}, está en el texto del chat.',
+    '{n}, te pasé todo por escrito.',
+    'Bárbaro {n}, mirá el mensaje escrito.',
+    'Ok {n}, en el texto está la info.',
+];
+
+function elegirFraseFallbackAudioCortoAcuse(session, primerNombre) {
+    const ultima = session?.ultimoFallbackAudioCortoAcuse ? String(session.ultimoFallbackAudioCortoAcuse) : null;
+    const n = primerNombre && String(primerNombre).trim() ? String(primerNombre).trim() : '';
+    const pool = n
+        ? FALLBACK_AUDIO_CORTO_CON_NOMBRE.map((t) => t.replace(/\{n\}/g, n))
+        : [...FALLBACK_AUDIO_CORTO_SIN_NOMBRE];
+    const distintos = ultima ? pool.filter((f) => f !== ultima) : pool;
+    const usar = distintos.length ? distintos : pool;
+    return usar[Math.floor(Math.random() * usar.length)];
+}
+
 /**
  * Núcleo compartido: Gemini + marcadores + historial (WhatsApp e Instagram DM).
  * @param {object} deps - dependencias inyectadas desde bot.js
@@ -98,6 +144,23 @@ async function ejecutarTurnoVickyGeminiCore(deps, params) {
         return;
     }
 
+    // Última línea de defensa: humano / panel silenciaron mientras el bot “escribía” (WhatsApp e Instagram).
+    if (firestoreModule.isAvailable() && typeof firestoreModule.getChatSilenceState === 'function') {
+        try {
+            const st0 = await firestoreModule.getChatSilenceState(remoteJid, { bypassCache: true });
+            if (st0?.shouldSilence) {
+                if (session) {
+                    session.humanAtendiendo = true;
+                    session.humanTimestamp = Date.now();
+                }
+                console.log(`🔇 Gemini omitido: chat silenciado (${remoteJid})`);
+                return;
+            }
+        } catch (_) {
+            /* no cortar */
+        }
+    }
+
     try {
         const chat = vickyGeminiModel.startChat({
             history: session.chatHistory,
@@ -169,8 +232,24 @@ async function ejecutarTurnoVickyGeminiCore(deps, params) {
                 /* no cortar turno */
             }
         }
+        let ctxKontrolpro = '';
+        if (
+            !esIg
+            && kontrolproBridge.isConfigured()
+            && typeof digitosRemitenteChat === 'function'
+        ) {
+            try {
+                const dig = digitosRemitenteChat(remoteJid);
+                if (dig && String(dig).replace(/\D/g, '').length >= 8) {
+                    ctxKontrolpro = await kontrolproBridge.buildContextoClienteParaGemini(dig);
+                }
+            } catch (e) {
+                console.warn('Kontrolpro contexto cliente (Gemini):', e.message);
+            }
+        }
+
         const ctxLeerPrimero =
-            '[LECTURA_OBLIGATORIA] Antes de redactar, integrá en orden: (1) [HILO_WHATSAPP_RECIENTE] si aparece abajo, (2) [CONTEXTO_HISTORIAL_CONSULTAS] y [CONTEXTO_SISTEMA] si están en el historial del modelo, (3) [LECTURA_CHAT_PREVIO], y (4) el mensaje actual del cliente. Respondé alineado al tema que venían tratando; no reinicies de cero salvo que el cliente cambie de asunto.';
+            '[LECTURA_OBLIGATORIA] Antes de redactar, integrá en orden: (1) [HILO_CHAT_RECIENTE] si aparece abajo, (2) [CONTEXTO_KONTROLPRO] si aparece abajo (datos de oficina: saldos y fechas de trabajos/entregas), (3) [CONTEXTO_HISTORIAL_CONSULTAS] y [CONTEXTO_SISTEMA] si están en el historial del modelo, (4) [LECTURA_CHAT_PREVIO], y (5) el mensaje actual del cliente. Respondé alineado al tema que venían tratando; no reinicies de cero salvo que el cliente cambie de asunto.';
         const nomServPub =
             publicidadLead?.servicio === 'lena'
                 ? 'leña'
@@ -181,8 +260,14 @@ async function ejecutarTurnoVickyGeminiCore(deps, params) {
             ? `[CONTEXTO_PUBLICIDAD] El cliente llegó desde publicidad (${publicidadLead.origen}) sobre ${nomServPub}. NO preguntes qué producto le interesa ni enumeres otros servicios. Respondé directo con precios/info del sistema para ${nomServPub}. Si el mensaje es muy vago, pedí UN dato concreto (medidas, cantidad o zona) para ese producto.`
             : '';
 
+        const ctxCanalIg = esIg
+            ? '[CONTEXTO_CANAL_INSTAGRAM] Mismas reglas operativas que WhatsApp: precios y textos de Firestore servicios/*, tono e instructivo del panel, marcadores CRM/handoff. Respondé con la misma calidad que en WhatsApp: cotizá, orientá y usá marcadores; no digas que "por Instagram no podés ayudar" ni desvíes la venta sin motivo. El cliente ya está en DM de @gardens.wood: no lo mandés a "mirar el perfil de Instagram" o "ver fotos en Instagram" para inspirarse — ya está en el canal. Si necesita galería en imágenes, PDF o nota de voz, ahí sí invitá a escribir por WhatsApp a Gardens Wood (mismo negocio y precios). Por DM no se envían adjuntos binarios: los [IMG:…] los traduce el sistema a texto puente. [PEDIDO_LENA] no encola reparto desde Instagram; para cola de ruta de leña y seguimiento fino ofrecé WhatsApp. No inventes números de teléfono.'
+            : '';
+
         const ctxTiempo = [
             ctxHiloFs,
+            ctxKontrolpro,
+            ctxCanalIg,
             ctxCierreEntregaPostHumano,
             ctxLeerPrimero,
             ctxLectura,
@@ -608,16 +693,22 @@ async function ejecutarTurnoVickyGeminiCore(deps, params) {
         }
 
         let audioEnviado = false;
+        /** TTS corto ante nota de voz del cliente: no debe silenciar la respuesta larga de Gemini (solo acuse). */
+        let audioEnviadoEsSoloAcuseNotaCliente = false;
         if (tieneAudio && audioTtsHabilitado) {
             const histCliente = getCliente(remoteJid);
-            const nombre = histCliente?.nombre;
+            const primerNom = primerNombreClienteDesdeHistorial(histCliente);
             if (fraseAudioCorto) {
                 audioEnviado = await enviarAudioElevenLabs(sendBotMessage, remoteJid, fraseAudioCorto);
             } else {
-                const fallback = nombre ? `Dale ${nombre}, ya te mando la info.` : `Dale, ya te mando la info.`;
+                const fallback = elegirFraseFallbackAudioCortoAcuse(session, primerNom);
                 audioEnviado = await enviarAudioElevenLabs(sendBotMessage, remoteJid, fallback);
+                if (audioEnviado && session) session.ultimoFallbackAudioCortoAcuse = fallback;
             }
-            if (audioEnviado) await delay(800);
+            if (audioEnviado) {
+                audioEnviadoEsSoloAcuseNotaCliente = true;
+                await delay(800);
+            }
         }
 
         const imgMatch = respuesta.match(/\[IMG:(lena|cerco|pergola|fogonero|bancos)\]/i);
@@ -662,7 +753,10 @@ async function ejecutarTurnoVickyGeminiCore(deps, params) {
         }
         const textoFinal = textoSinSaludo;
         const hayImagen = !!imgMatch;
-        const debeEnviarTexto = !audioEnviado || (audioEnviado && hayImagen);
+        const debeEnviarTexto =
+            !audioEnviado
+            || (audioEnviado && hayImagen)
+            || (audioEnviado && audioEnviadoEsSoloAcuseNotaCliente);
         console.log(
             `📝 Texto (${textoFinal.length} chars, audio=${audioEnviado}, img=${hayImagen}, enviar=${debeEnviarTexto}): "${textoFinal.substring(0, 100)}"`
         );
@@ -731,6 +825,10 @@ async function ejecutarTurnoVickyGeminiCore(deps, params) {
             const textoFallback = `Disculpá, no logré entender bien tu consulta 😅\n¿Podés contarme un poco más? Así te oriento bien.`;
             await sendTextoSaliente(textoFallback);
             mensajeSalienteTexto = textoFallback;
+        } else if (audioEnviado && textoFinal.length > 0) {
+            console.log(
+                `🎙️ Audio enviado; texto de ${textoFinal.length} chars omitido (TTS ya cubría la respuesta o canal sin duplicar).`
+            );
         } else {
             console.log(`⚠️ Texto vacío pero audio enviado — OK`);
         }

@@ -4,13 +4,40 @@
 Checklist rápida para desplegar cambios sin romper:
 - Bot WhatsApp (`vicky-bot` en Cloud Run)
 - Dashboard (`vicky-dashboard` en Cloud Run)
+- **Kontrolpro** (SPA Vite en el mismo proyecto GCP que Vicky; Supabase como base del ERP)
 - Firestore (reglas, índices, datos: `config/*`, `servicios/*`, etc.)
+
+### Kontrolpro + Vicky (`#kp`)
+- **Directo:** en Cloud Run → `KONTROLPRO_SUPABASE_URL` y `KONTROLPRO_SUPABASE_SERVICE_ROLE_KEY` (no la `anon`).
+- **Lovable Cloud / sin pegar service_role en el bot:** `KONTROLPRO_PROXY_URL` (POST a la Edge Function) + `KONTROLPRO_PROXY_SECRET` (= `EXTERNAL_API_KEY` en Lovable). Plantilla: `kontrolpro/plan-wizardry-forge-main/supabase/functions/kontrolpro-bridge-vicky/index.ts`. Guía: [docs/KONTROLPRO_LOVABLE_PROXY.md](docs/KONTROLPRO_LOVABLE_PROXY.md).
+- Sin ninguna de las dos opciones, `#kp` indica que falta configuración.
+- Tras cambios en `kontrolpro-bridge.js` / `kontrolpro-admin.js` / `bot.js`: **redeploy `vicky-bot`** e instalar dependencia `@supabase/supabase-js` (`npm install` en la raíz del repo antes del build Docker).
+- En el front Kontrolpro: `VITE_VICKY_DASHBOARD_URL` = URL HTTPS del dashboard Firebase (build `.env`); el botón **Vicky booth** abre esa URL en pestaña nueva.
+- **Contexto Kontrolpro en conversación cliente (Gemini):** con las mismas variables Supabase en `vicky-bot`, cada turno WhatsApp puede inyectar datos de **ventas / saldo / trabajo programado / entrega** si el `clients.phone` en Supabase coincide con el número del chat (y LID mapeado a tel). Solo lectura; desactivar con `VICKY_KONTROLPRO_CONTEXTO_CLIENTE=0`. Log: `VICKY_LOG_KONTROLPRO_CLIENTE=1`.
+
+### Checklist definitivo (Kontrolpro + bot)
+
+1. **Cloud Run → servicio `vicky-bot` (región `us-central1`)**  
+   Tras `gcloud run deploy …` o `npm run deploy`, la URL pública suele ser `https://vicky-bot-<hash>.us-central1.run.app` (ver consola o salida del comando).  
+   **Variables para `#kp` y contexto cliente** (elegí **directo** *o* **proxy**, no hace falta ambos):  
+   | Variable | Uso |
+   |----------|-----|
+   | `KONTROLPRO_SUPABASE_URL` + `KONTROLPRO_SUPABASE_SERVICE_ROLE_KEY` | Conexión directa (URL + *service_role* del proyecto). |
+   | `KONTROLPRO_PROXY_URL` + `KONTROLPRO_PROXY_SECRET` | Edge Function en Lovable/Supabase; el secreto = `EXTERNAL_API_KEY` en Lovable. Ver [docs/KONTROLPRO_LOVABLE_PROXY.md](docs/KONTROLPRO_LOVABLE_PROXY.md). |
+   Opcionales: `VICKY_KONTROLPRO_CONTEXTO_CLIENTE=0` (apagar bloque Gemini cliente), `VICKY_LOG_KONTROLPRO_CLIENTE=1` (logs `[kontrolpro-cliente]`).  
+   En consola: **Cloud Run** → `vicky-bot` → **Editar y desplegar nueva revisión** → **Variables y secretos** → añadir/editar → **Desplegar**. Si ya existían, un deploy por CLI **suele conservarlas**; igual conviene verificar tras cada despliegue.
+
+2. **Kontrolpro (SPA)**  
+   En `kontrolpro/plan-wizardry-forge-main/`: `.env` con `VITE_SUPABASE_*` (anon/public) según el proyecto Lovable, más **`VITE_VICKY_DASHBOARD_URL`** = URL HTTPS del panel Firebase (`vicky-dashboard`). Luego `npm run build` y publicar el contenido de **`dist/`** en el hosting que uses (Firebase Hosting, Cloud Run estático, Lovable, etc.). Sin ese build + deploy, el código nuevo del sidebar no llega a la URL pública.
+
+3. **Dashboard Firebase (`vicky-dashboard`)**  
+   Solo hace falta redeploy si cambiaste código en `dashboard/`; no es requisito para Kontrolpro en Supabase.
 
 ## Tabla maestra: campo → panel → bot → reinicio
 
 | Dónde en Firestore | Ruta en panel | Efecto en el bot | ¿Reinicio / redeploy? |
 |--------------------|---------------|------------------|------------------------|
-| `config/prompts` → `sistemaPrompt` | Instrucciones AI | Instrucción base de Vicky (tono, reglas). El proceso **siempre concatena** después: bloque de precios desde `servicios/*`, anexos en código **ubicación** (`SYSTEM_PROMPT_SUFIJO_UBICACION_MARCADORES`), **nombre en saludo** (`SYSTEM_PROMPT_SUFIJO_NOMBRE_SALUDO`) y **cola leña** (`SYSTEM_PROMPT_SUFIJO_COLA_LENA`: sin `[PEDIDO_LENA:…]` no hay fila en cola/panel) — no hace falta repetirlos en el panel | Sí: redeploy `vicky-bot` si cambia el anexo en código |
+| `config/prompts` → `sistemaPrompt` | Instrucciones AI | Instrucción base de Vicky (tono, reglas). Al leer Firestore, `firestore-module.js` puede **omitir párrafos** (bloques separados por línea en blanco) que parezcan instructivo inmobiliario ajeno; revisá consola y el panel si ves avisos. Después: precios `servicios/*`, anexos **ubicación**, **nombre en saludo**, **cola leña** y **cierre exclusión inmobiliaria** (`SYSTEM_PROMPT_SUFIJO_EXCLUSION_INMO_OTROS` en `bot.js`). | Sí: redeploy `vicky-bot` si cambia el anexo en código |
 | `config/prompts` → `mensajeBienvenidaTexto` | Instrucciones AI | Texto tras audio de bienvenida | Sí: redeploy bot |
 | `config/prompts` → `mensajeClienteCierreEntregaHumano` | Instrucciones AI → **Cierre entrega** | WhatsApp al cliente cuando admin manda `#final_entrega` | Sí: redeploy bot si cambia código; el texto en Firestore se lee al ejecutar el comando |
 | `config/prompts` → `instruccionCierreEntregaHumanoGemini` | Instrucciones AI → **Cierre entrega** | Bloque extra a Gemini mientras `chats/{jid}.cierreEntregaAsistido` | Igual; lectura por turno |
@@ -47,17 +74,18 @@ Para que Cursor sugiera buenas prácticas al **optimizar automatizaciones y fluj
 - Guía panel ↔ Firestore ↔ bot (recuperación, historial de prompts, redeploy): [`docs/CONFIGURACION_PANEL_Y_BOT.md`](docs/CONFIGURACION_PANEL_Y_BOT.md).
 - Panel → `General` (`/config/general`)
   - `delayMinSeg`, `delayMaxSeg`
+  - **`debounceChatSeg`**, **`debounceChatMaxMensajes`** — varios textos seguidos del cliente en WhatsApp se fusionan en un solo turno Gemini (default ~3 s y 3 mensajes). `debounceChatSeg: 0` apaga. Env en Cloud Run: **`VICKY_CHAT_DEBOUNCE_MS`**, **`VICKY_CHAT_DEBOUNCE_MAX_PARTES`** (pisan Firestore si están definidos).
   - `modeloGemini` — id en Gemini API (default en código: `gemini-3.1-flash-lite-preview`). Opcional en Cloud Run: **`GEMINI_MODEL`** pisa Firestore/panel si necesitás forzar otro id sin editar `config/general`.
   - `tiempoSilencioHumanoHoras`
   - `botActivo`
-  - **DMs Instagram:** `instagramDmActivo` — si está en *false*, Vicky no responde por Instagram (WhatsApp sigue gobernado por `botActivo`). Requiere variables de entorno del webhook en Cloud Run (ver §2d).
-  - **Etiqueta WhatsApp Business — “Contactar asesor”:** campo `whatsappLabelIdContactarAsesor` (ID interno de la etiqueta que creás en la app Business). Al handoff (`[HANDOFF_EXPERTO]`), el bot llama `addChatLabel` en ese chat. Para descubrir el `id`: **con el bot apagado**, `npm run labels:discover` (escucha ~90 s y lista `id="…" name="…"`); o arrancá el bot con `VICKY_LOG_LABELS=1` y leé la consola. Requiere cuenta **WhatsApp Business** vinculada al bot.
+  - **DMs Instagram:** `instagramDmActivo` — si está en *false*, Vicky no responde por Instagram (WhatsApp sigue gobernado por `botActivo`). Requiere variables de entorno del webhook en Cloud Run (ver §2d). **`instagramDmSoloEnlaceWhatsapp`** (default *true*): solo responde con texto + `https://wa.me/…` (sin Gemini); desactivar para volver a IA. **`whatsappAtencionCliente`** (dígitos) o env **`VICKY_WHATSAPP_LINK_DIGITS`** definen el enlace.
+  - **Etiqueta WhatsApp Business — “Contactar asesor”:** campo `whatsappLabelIdContactarAsesor` (ID interno de la etiqueta que creás en la app Business). Al handoff (`[HANDOFF_EXPERTO]`), el bot llama `addChatLabel` en ese chat. Para descubrir el `id`: **con el bot apagado**, `npm run labels:discover` (fuerza `resyncAppState` y escucha ~90 s; lista `id="…" name="…"`); o arrancá el bot con `VICKY_LOG_LABELS=1`: al abrir WA hace **resync de app state** (~2,5 s) y luego deberían verse líneas `[VICKY_LOG_LABELS] etiqueta → …` (el bot usa historial sync desactivado y sin eso Baileys a veces no traía etiquetas). Requiere cuenta **WhatsApp Business** vinculada al bot.
   - **Campañas (#RUTA):** delay mín/máx entre mensajes Baileys, tope de destinatarios y % de descuento en el texto. Twilio masivo (plantilla) es opcional vía variables de entorno en Cloud Run (ver `.env.example`).
   - **WhatsApp operación — datos de entrega:** `datosEntregaNotifyPhone` (dígitos, ej. `5493512956376`). Cuando el cliente manda en un solo mensaje teléfono de contacto + dirección/zona + franja horaria, Vicky (vía regla del system prompt) agrega `[NOTIFICAR_DATOS_ENTREGA]` y el bot reenvía **el texto del cliente** a ese WhatsApp. Vacío en panel → usa `VICKY_DATOS_ENTREGA_NOTIFY_PHONE` en Cloud Run o el default del código. **Redeploy** `vicky-bot` tras cambiar el campo. Si `config/prompts.sistemaPrompt` en Firestore **reemplaza** el prompt completo, hay que **añadir la misma regla** allí (ver `bot.js` regla **21b**) o el modelo no emitirá el marcador.
   - **Grupo WhatsApp — agenda de entregas:** `whatsappGrupoJidAgendaEntregas` puede ser **JID** `…@g.us`, **enlace** `https://chat.whatsapp.com/…` o **código** de invitación (el bot resuelve a JID al avisar). Toggle `notificarAgendaEntregasGrupoActivo` (default true). Cada **alta** en `entregas_agenda` (panel, `[ENTREGA:…]`, `#entrega` admin) dispara un mensaje resumen en ese grupo; la sesión del bot debe ser miembro del grupo. Fallback env: `WHATSAPP_GRUPO_JID_AGENDA_ENTREGAS`. El JID y el toggle de avisos se leen **sin el caché de 5 min** en cada envío al grupo (el resto de `config/general` sigue con caché). El texto del aviso **prioriza 📞** (`telefonoContacto` + tel en `clientes/*` vía JID) y **no muestra la línea 💬 Chat** si ya hay tel o si el JID es `@lid` sin número claro (indica revisar panel/CRM). **Diagnóstico:** en logs de Cloud Run buscá `[agenda-grupo]` (falta JID, toggle off, `groupMetadata` o error de envío) y `sendBotMessage … (grupo …)`. **Cómo obtener el JID del grupo:** con el bot apagado y sesión en `auth_info_baileys`, `npm run wa:grupo-jid -- --list` o `npm run wa:grupo-jid -- --invite CODIGO` (código del enlace `chat.whatsapp.com/…`); ver `scripts/whatsapp-grupo-jid.js` y `docs/FIRESTORE_SCHEMA.md`.
   - Guardar
 
-**Nota**: el bot aplica la config al arrancar. **Silencio por humano desde el teléfono**: siempre **24 h** en código (no depende de `tiempoSilencioHumanoHoras`). El panel sigue pudiendo silenciar con `humanoAtendiendo` / `silenciadoHasta`. Tras **`#activo global`** o reactivar en panel, Firestore queda bien; el código **alinea la sesión en RAM** con `getChatSilenceState` en cada mensaje entrante para que un flag `humanoAtendiendo` viejo en memoria no bloquee si `chats/{jid}` ya está limpio (Cloud Run, réplicas o estado previo). **Instructivo en Firestore:** si `config/prompts.sistemaPrompt` quedó con texto de otro negocio, revisalo en el panel (o historial de versiones); el código **anteponde** el bloque fijo «IDENTIDAD GARDENS WOOD» al system instruction para priorizar Gardens Wood.
+**Nota**: el bot aplica la config al arrancar. **Silencio por humano desde el teléfono**: siempre **24 h** en código (no depende de `tiempoSilencioHumanoHoras`). Cada mensaje saliente **desde la cuenta del negocio** que **no** es el eco de un envío de Vicky (mismo criterio: id en `BOT_MSG_IDS`) marca `humanoAtendiendo` en Firestore y silencia; **no** hay ventana de gracia por tiempo (así también silencia si el humano escribe poco después de un mensaje del bot). El panel sigue pudiendo silenciar con `humanoAtendiendo` / `silenciadoHasta`. Tras **`#activo global`** o reactivar en panel, Firestore queda bien; el código **alinea la sesión en RAM** con `getChatSilenceState` en cada mensaje entrante para que un flag `humanoAtendiendo` viejo en memoria no bloquee si `chats/{jid}` ya está limpio (Cloud Run, réplicas o estado previo). **Instructivo en Firestore:** si `config/prompts.sistemaPrompt` quedó con texto de otro negocio (p. ej. inmobiliaria), revisalo en el panel (o historial de versiones); el código **anteponde** «IDENTIDAD GARDENS WOOD», **filtra** párrafos inmobiliarios obvios al cargar y **cierra** con un bloque fijo que prohíbe mezclar ese rubro. Igual conviene dejar el doc del panel limpio.
 
 **Cliente vs admin:** los mensajes entrantes pasan primero por el filtro admin; el texto **normal** del cliente debe continuar al flujo Vicky (Gemini). Si el admin responde pero el cliente no, revisá `botActivo`, silencio en `chats/*` y logs (`VICKY_LOG_INCOMING=1`).
 
@@ -211,7 +239,7 @@ El servicio `vicky-bot` expone rutas HTTP internas (mismo puerto que el healthch
 |----------|-----|
 | `VICKY_CRON_SECRET` | Token largo aleatorio. Las peticiones deben enviar cabecera `Authorization: Bearer <mismo valor>` (sin espacios de más; el bot recorta el valor de la variable). Si en Scheduler usás **autenticación OIDC** de Google y eso pisa `Authorization`, agregá además cabecera **`X-Vicky-Cron-Secret`** con el mismo secreto (solo el token, sin `Bearer`). |
 | `GEOCODE_NOMINATIM_UA` | Opcional. User-Agent en solicitudes a Nominatim (política OSM); si no se define, el cron usa un valor por defecto identificable. |
-| `VICKY_LOG_CRON_AUTH` | Opcional. Si es `1`, ante 401 en `/internal/cron/*` el bot escribe en consola pistas (longitudes, si hay Bearer; **no** imprime secretos). |
+| `VICKY_LOG_CRON_AUTH` | Opcional. Si es `1`, ante 401 en `/internal/cron/*` el bot escribe en consola más pistas (método, URL; **no** imprime secretos). El 401 ya registra `secretLen`, `authHdrLen` y `xVickyLen` (longitud de `X-Vicky-Cron-Secret` normalizada). |
 | `VICKY_CRON_ALLOW_BODY_SECRET` | Opcional. Si es `1`, además de cabeceras acepta el secreto en JSON: `{"cronSecret":"<mismo que VICKY_CRON_SECRET>"}` (útil si algo elimina `Authorization`). |
 | `OPENWEATHER_API_KEY` | Opcional pero necesaria para el job de clima (Córdoba). Sin clave, el endpoint de clima no hace nada útil. |
 | `CAMPANA_USE_TWILIO`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_FROM`, `TWILIO_CAMPANA_CONTENT_SID` | Opcional: enviar campaña `#RUTA` por plantilla Twilio en lugar de solo Baileys. Ver `.env.example`. |
@@ -239,6 +267,8 @@ El servicio `vicky-bot` expone rutas HTTP internas (mismo puerto que el healthch
 - Frecuencia (cron): según volumen. Ejemplos: `*/20 * * * *` (cada 20 minutos); `30 3 * * *` (03:30 diario, hora baja). Timezone típica: `America/Buenos_Aires`.
 - Si en panel **General** está **`geocodeCronActivo: false`**, la respuesta será `skipped: true` (no escribe Firestore).
 
+**401 en logs (`⚠️ Cron 401 … secretLen=64 authHdrLen=14`):** el valor de `Authorization` que llega al bot **no coincide en longitud ni en bytes** con `VICKY_CRON_SECRET` en Cloud Run (ej. Scheduler con token corto, placeholder, o secreto viejo tras rotación). Copiá el secreto actual desde Cloud Run → `vicky-bot` → Variables y pegalo entero en el job (cabecera `Authorization: Bearer …` o, si usás OIDC, **`X-Vicky-Cron-Secret`** con el mismo valor completo). Tras un deploy, el log incluye `xVickyLen=` (longitud de esa cabecera) para comparar con `secretLen=` sin exponer el token.
+
 Tras definir secretos, **nueva revisión** de Cloud Run no es obligatoria solo por crear jobs; sí hace falta redeploy si cambiás código o variables.
 
 ## 2d) Instagram DM (webhook público en `vicky-bot`)
@@ -256,12 +286,13 @@ El mismo servicio Cloud Run que atiende WhatsApp expone **`GET` y `POST /webhook
 | `META_APP_SECRET` | Secreto de la app en Meta; valida la firma del cuerpo POST. **Definilo en producción**; sin esto el código no puede comprobar la firma de forma fiable. |
 | `INSTAGRAM_PAGE_ACCESS_TOKEN` | Token de página (larga duración) con permisos para enviar mensajes. Alias aceptado: `FACEBOOK_PAGE_ACCESS_TOKEN`. |
 | `META_GRAPH_VERSION` | Opcional, default `v21.0`. |
+| `VICKY_INSTAGRAM_DM` | Opcional. `0`, `false`, `no` u `off` → **no** responde por Instagram (prioridad sobre `instagramDmActivo` del panel). Vacío = según panel/Firestore. |
 
 **Si Vicky no responde Instagram:** en Cloud Run → `vicky-bot` → **Variables y secretos** deben figurar **las tres** (`INSTAGRAM_WEBHOOK_VERIFY_TOKEN`, `META_APP_SECRET`, `INSTAGRAM_PAGE_ACCESS_TOKEN`). Si no están definidas, Meta no puede completar el webhook con firma válida o el bot no puede enviar el DM. Revisá también en **Logging** que existan `POST` a `/webhooks/instagram` tras un mensaje de prueba.
 
 **Panel:** en **General** podés desactivar solo Instagram con **`instagramDmActivo: false`** sin apagar WhatsApp.
 
-**Notas:** en la versión actual, Instagram recibe **texto** (sin audio de bienvenida ni adjuntos binarios como en WhatsApp); el hilo en Firestore usa `chats/ig:{senderId}` y `clientes/ig:{senderId}` con `canal: instagram`. Silenciar chat desde el dashboard usa el mismo doc `chats/ig:…` si abrís ese chat.
+**Notas:** Instagram usa el mismo **delay** que WhatsApp (`config/general` → `delayMinSeg` / `delayMaxSeg`) y la misma cadena de **silencio** (Firestore sin caché + revalidación tras la espera, y antes de Gemini). Recibe **texto** (sin audio de bienvenida ni adjuntos binarios como en WhatsApp); el hilo en Firestore usa `chats/ig:{senderId}` y `clientes/ig:{senderId}` con `canal: instagram`. Silenciar chat desde el dashboard usa el mismo doc `chats/ig:…` si abrís ese chat.
 
 ### Política de privacidad (Meta App Review)
 
@@ -288,6 +319,22 @@ gcloud run deploy vicky-bot --source . --region=us-central1 --platform=managed -
 ```
 
 Tras el deploy, en **Cloud Run → `vicky-bot` → Editar y desplegar nueva revisión** cargá también las variables de §2d si usás Instagram. La ruta `/webhooks/instagram` debe ser alcanzable públicamente (Cloud Run “Allow unauthenticated” en el servicio, como suele ser el healthcheck).
+
+**Audio de bienvenida (primer contacto WhatsApp):** los archivos `ElevenLabs_*.mp3` no van en Git (`.gitignore`), así que en Cloud Run el contenedor puede arrancar sin ellos. El bot, **después de** sincronizar `auth/` desde GCS, intenta bajar desde el **mismo bucket** (`VICKY_GCS_BUCKET` o default) los objetos:
+
+- `bot_media/ElevenLabs_2026-03-21T11_41_40_Melisa_pvc_sp110_s91_sb75_se0_b_m2.mp3`
+- `bot_media/ElevenLabs_2026-03-21T12_03_41_Melisa_pvc_sp110_s91_sb75_se0_b_m2.mp3`
+
+**Si no están en GCS:** con **`ELEVENLABS_API_KEY`** y **`ELEVENLABS_VOICE_ID`** en Cloud Run (ya usados para notas de voz), el bot **genera** esos MP3 por TTS al conectar WhatsApp, los guarda en `/app/` y los **sube** a `bot_media/` para el próximo arranque. Textos: env opcional **`VICKY_AUDIO_INTRO_TTS`** / **`VICKY_AUDIO_CONFIRMADO_TTS`** (frase completa); desactivar recreación: **`VICKY_DISABLE_TTS_AUDIO_BOOTSTRAP=1`**.
+
+Subida manual opcional (misma voz que exportaste en el panel), ajustando bucket si usás otro:
+
+```powershell
+gsutil cp "ElevenLabs_2026-03-21T11_41_40_Melisa_pvc_sp110_s91_sb75_se0_b_m2.mp3" "gs://webgardens-8655d_whatsapp_session/bot_media/"
+gsutil cp "ElevenLabs_2026-03-21T12_03_41_Melisa_pvc_sp110_s91_sb75_se0_b_m2.mp3" "gs://webgardens-8655d_whatsapp_session/bot_media/"
+```
+
+Prefijo distinto: variable **`VICKY_GCS_BOT_MEDIA_PREFIX`** (ej. `media/vicky`, sin slashes al inicio/fin). Para no intentar bajar desde GCS: **`VICKY_DISABLE_GCS_BOT_MEDIA=1`**. Rutas locales alternativas: **`VICKY_AUDIO_INTRO_PATH`** / **`VICKY_AUDIO_CONFIRMADO_PATH`** (absolutas o relativas al directorio del `bot.js`). En logs: `🎵 Audio intro (tras sync GCS)` o **`tras recreación ElevenLabs`**.
 
 Alternativa (script):
 

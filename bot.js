@@ -144,6 +144,7 @@ function isCronRequestAuthorized(req) {
 function logCronAuth401(req, pathLabel, extra = {}) {
     const s = vickyCronSecretTrimmed();
     const auth = String(req.headers.authorization || req.headers.authorisation || '');
+    const xNorm = normalizeCronCredential(req.headers['x-vicky-cron-secret']);
     const keys = Object.keys(req.headers || {})
         .filter((k) => /auth|secret|cron|forward/i.test(k))
         .join(',');
@@ -154,8 +155,8 @@ function logCronAuth401(req, pathLabel, extra = {}) {
         s.length,
         'authHdrLen=',
         auth.length,
-        'xVicky=',
-        !!normalizeCronCredential(req.headers['x-vicky-cron-secret']),
+        'xVickyLen=',
+        xNorm.length,
         'hdrKeys=',
         keys || '(ninguna coincidencia)',
         extra?.bodySecretTried ? 'bodySecret=si' : ''
