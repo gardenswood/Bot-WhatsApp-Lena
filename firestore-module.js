@@ -874,15 +874,18 @@ async function reactivarChatsParcialDesdeFirestore() {
 
 /**
  * Lee si un chat está silenciado por humano desde Firestore.
- * Retorna { humanoAtendiendo, silenciadoHasta, shouldSilence }.
+ * Retorna { humanoAtendiendo, silenciadoHasta, shouldSilence, cierreEntregaAsistido }.
+ * @param {string} jid
+ * @param {{ bypassCache?: boolean }} [opts] — `bypassCache: true` fuerza lectura a Firestore (tras handoff / silencio).
  */
-async function getChatSilenceState(jid) {
+async function getChatSilenceState(jid, opts) {
+    const bypassCache = !!(opts && opts.bypassCache);
     const fallback = { humanoAtendiendo: false, silenciadoHasta: null, shouldSilence: false, cierreEntregaAsistido: false };
     if (!firestoreDb || !jid) return fallback;
 
     const now = Date.now();
     const cached = chatSilenceCache.get(jid);
-    if (cached && (now - cached.fetchedAt) < chatSilenceTtlMs) {
+    if (!bypassCache && cached && (now - cached.fetchedAt) < chatSilenceTtlMs) {
         const v = cached.value || {};
         return {
             humanoAtendiendo: v.humanoAtendiendo === true,

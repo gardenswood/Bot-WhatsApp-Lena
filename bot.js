@@ -1000,6 +1000,12 @@ const vickyRuntimeCfg = {
 };
 let vickySeguimientoIniciado = false;
 
+/**
+ * Tras un `fromMe` humano, el upsert del cliente puede llegar antes de que Firestore refleje `humanoAtendiendo`.
+ * Sin esta gracia, el bloque "alinear RAM" borraba `session.humanAtendiendo` y Vicky volvía a contestar.
+ */
+const HUMAN_RAM_FIRESTORE_SYNC_GRACE_MS = 8000;
+
 /** Orden: `GEMINI_MODEL` (env) → `vickyRuntimeCfg.MODEL_GEMINI` (Firestore tras bootstrap) → default. */
 function modeloGeminiActivo() {
     const env = String(process.env.GEMINI_MODEL || '').trim();
@@ -4985,9 +4991,15 @@ async function procesarMensajeInstagram(instagramPsid, text) {
             return;
         }
         const sAlinear = SESSIONS.get(remoteJid);
-        if (sAlinear) {
-            sAlinear.humanAtendiendo = false;
-            sAlinear.humanTimestamp = null;
+        if (sAlinear && silence && silence.humanoAtendiendo !== true) {
+            const recienteHumanoRam =
+                sAlinear.humanAtendiendo === true
+                && typeof sAlinear.humanTimestamp === 'number'
+                && Date.now() - sAlinear.humanTimestamp < HUMAN_RAM_FIRESTORE_SYNC_GRACE_MS;
+            if (!recienteHumanoRam) {
+                sAlinear.humanAtendiendo = false;
+                sAlinear.humanTimestamp = null;
+            }
         }
     }
 
@@ -7953,10 +7965,18 @@ Ejemplos de cómo traducir instrucciones:
                 }
                 // Firestore = no silenciado: alinear RAM. Sin esto, `session.humanAtendiendo` viejo (misma réplica u
                 // otra instancia Cloud Run antes de #activo global / panel) sigue bloqueando aunque `chats/*` ya esté OK.
+                // Ojo carrera: si el humano acaba de escribir (`fromMe`), RAM ya puede tener `humanAtendiendo` antes
+                // de que `setHumanoAtendiendo` confirme en Firestore — no borrar RAM en esa ventana.
                 const sAlinear = SESSIONS.get(remoteJid);
-                if (sAlinear) {
-                    sAlinear.humanAtendiendo = false;
-                    sAlinear.humanTimestamp = null;
+                if (sAlinear && silence && silence.humanoAtendiendo !== true) {
+                    const recienteHumanoRam =
+                        sAlinear.humanAtendiendo === true
+                        && typeof sAlinear.humanTimestamp === 'number'
+                        && Date.now() - sAlinear.humanTimestamp < HUMAN_RAM_FIRESTORE_SYNC_GRACE_MS;
+                    if (!recienteHumanoRam) {
+                        sAlinear.humanAtendiendo = false;
+                        sAlinear.humanTimestamp = null;
+                    }
                 }
             }
 
